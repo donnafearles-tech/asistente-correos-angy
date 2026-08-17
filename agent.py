@@ -4,6 +4,11 @@ os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "TRUE"
 
 from google.adk.agents.llm_agent import Agent
 
+# URL del backend Node.js (auto-detecta si está en Cloud Run o local)
+IS_CLOUD_RUN = os.environ.get("K_SERVICE") is not None
+DEFAULT_BACKEND = "https://customer-information-720693669884.us-central1.run.app" if IS_CLOUD_RUN else "http://localhost:3000"
+BACKEND_URL = os.environ.get("BACKEND_URL", DEFAULT_BACKEND)
+
 # Lista negra de teléfonos de empresa corporativos
 COMPANY_PHONES = {"8882494189", "18882494189"}
 
@@ -13,7 +18,7 @@ def buscar_y_sanitizar_cliente(invoice: str) -> dict:
     limpia y sanitiza la información distinguiendo datos de empresa de datos de cliente,
     y bloquea estrictamente los teléfonos y correos corporativos (ej. 8882494189).
     """
-    url = f"http://localhost:3000/api/sheets/record-by-invoice?invoice={invoice}"
+    url = f"{BACKEND_URL}/api/sheets/record-by-invoice?invoice={invoice}"
     try:
         response = requests.get(url, timeout=10)
         if response.status_code != 200:
@@ -83,7 +88,7 @@ def procesar_caso_zendesk(invoice: str, nombre: str, email: str, telefono: str, 
     if clean_phone in COMPANY_PHONES:
         return {"error": "No se puede crear el caso de Zendesk: El teléfono es el número corporativo de la empresa (8882494189) y está prohibido usarlo."}
         
-    url = "http://localhost:3000/api/process-zendesk-case"
+    url = f"{BACKEND_URL}/api/process-zendesk-case"
     payload = {
         "invoice": invoice,
         "name": nombre,
@@ -107,7 +112,7 @@ def obtener_textos_de_archivos(invoice: str) -> dict:
     realiza el escaneo OCR y devuelve el nombre del archivo y el texto completo (transcripción) de cada uno.
     Utilízalo para analizar el contenido real de los archivos del cliente de manera inteligente.
     """
-    url = f"http://localhost:3000/api/invoice-raw-texts?invoice={invoice}"
+    url = f"{BACKEND_URL}/api/invoice-raw-texts?invoice={invoice}"
     try:
         response = requests.get(url, timeout=90)  # El OCR de múltiples archivos puede tardar un poco
         if response.status_code != 200:
@@ -127,7 +132,12 @@ Sigue estrictamente estas reglas al responder preguntas, procesar archivos o uti
 2. Prioridad de Documentos: Para extraer el nombre, apellido, correo o teléfono del cliente, prioriza siempre los archivos con 'VIP' o '_V' en el nombre. Si no existen, usa archivos con 'shippin' o 'shipping'. Si tampoco existen, usa archivos con 'PASS', 'ID' o 'PP'.
 3. Extracción de Email: Pon especial atención en extraer con precisión el correo electrónico del cliente desde los archivos VIP, ya que son la fuente primaria de verdad.
 4. Exclusiones de Archivos: Ignora por completo cualquier archivo que contenga 'gbk' o '5cc' en el nombre, ya que representan material promocional de la empresa o copias de tarjetas bancarias, no datos de contacto del cliente.
-5. Análisis inteligente de archivos: Si el usuario te pide analizar o extraer información de los archivos de una factura, usa la herramienta 'obtener_textos_de_archivos' para obtener sus transcripciones. Luego, analiza detalladamente el texto de todos los archivos juntos, distinguiendo la información del cliente del texto de la empresa, y descarta cualquier número de teléfono o correo corporativo (ej. 8882494189) antes de responder.""",
+5. Análisis inteligente de archivos: Si el usuario te pide analizar o extraer información de los archivos de una factura, usa la herramienta 'obtener_textos_de_archivos' para obtener sus transcripciones. Luego, analiza detalladamente el texto de todos los archivos juntos, distinguiendo la información del cliente del texto de la empresa, y descarta cualquier número de teléfono o correo corporativo (ej. 8882494189) antes de responder.
+6. Actualización de campos del formulario: Si el usuario te pide corregir, cambiar o actualizar un dato del cliente en el formulario (nombre, apellido, teléfono, email, ciudad, estado, código postal o productos), incluye en tu respuesta un bloque JSON con el siguiente formato EXACTO (sin backticks ni markdown):
+FIELD_UPDATE:{"name":"valor","lastName":"valor","telephone":"valor","email":"valor","city":"valor","state":"valor","zipCode":"valor","products":"valor"}
+Incluye SOLO los campos que el usuario quiere modificar. Por ejemplo, si solo quiere cambiar el email:
+FIELD_UPDATE:{"email":"nuevo@correo.com"}
+Si el usuario dice algo como "el correo es maria@gmail.com", "cambia el nombre a Juan", "el teléfono correcto es 3051234567", o "agrega producto X", responde confirmando el cambio Y emite el bloque FIELD_UPDATE correspondiente.""",
     tools=[buscar_y_sanitizar_cliente, procesar_caso_zendesk, obtener_textos_de_archivos],
 )
 
