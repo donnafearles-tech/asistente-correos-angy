@@ -12,8 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copiar el código del agente
 COPY . .
 
-# Puerto que expone el servidor web de ADK
-EXPOSE 8000
+# Cloud Run inyecta PORT=8080 automáticamente
+ENV PORT=8080
 
 # Variables de entorno requeridas (se configuran en Cloud Run):
 # - GOOGLE_CLOUD_PROJECT: tu proyecto de GCP
@@ -21,5 +21,5 @@ EXPOSE 8000
 # - BACKEND_URL: URL de tu servidor Node.js en Cloud Run
 #   (ej. https://customer-information-720693669884.us-central1.run.app)
 
-# Iniciar el servidor web del agente ADK
-CMD ["python", "-m", "google.adk.cli", "web", "--host", "0.0.0.0", "--port", "8000", "."]
+# Iniciar el servidor web del agente ADK en 0.0.0.0 usando el puerto de Cloud Run
+CMD python -m google.adk.cli web --host 0.0.0.0 --port $PORT .
