@@ -283,6 +283,24 @@ def buscar_clientes(filtro: str = None, campo: str = None, valor: str = None) ->
     except Exception as e:
         return {"error": f"Error de conexión al buscar clientes: {str(e)}"}
 
+def validar_correo(email: str) -> dict:
+    """
+    Valida si una dirección de correo electrónico es válida, entregable y existe
+    utilizando el motor de verificación Debounce.
+    
+    Args:
+        email: La dirección de correo electrónico a verificar (ej: 'ejemplo@gmail.com').
+    """
+    url = f"{BACKEND_URL}/api/validate-email"
+    payload = {"email": email}
+    try:
+        response = requests.post(url, json=payload, timeout=15)
+        if response.status_code == 200:
+            return response.json()
+        return {"error": f"Error al validar correo. Código: {response.status_code}, Detalle: {response.text}"}
+    except Exception as e:
+        return {"error": f"Error de conexión al validar correo: {str(e)}"}
+
 root_agent = Agent(
     model='gemini-3.6-flash',
     name='root_agent',
@@ -301,7 +319,8 @@ Incluye SOLO los campos que el usuario quiere modificar. Por ejemplo, si solo qu
 FIELD_UPDATE:{"email":"nuevo@correo.com"}
 Si el usuario dice algo como "el correo es maria@gmail.com", "cambia el nombre a Juan", "el teléfono correcto es 3051234567", o "agrega producto X", responde confirmando el cambio Y emite el bloque FIELD_UPDATE correspondiente.
 7. Consulta y búsqueda de clientes: Si el usuario te pregunta por listas de clientes que cumplan con ciertas condiciones (por ejemplo, clientes de una tienda, una región, compras de un producto específico, o notas como disputas), utiliza la herramienta 'buscar_clientes' para obtener los registros y respóndele de forma resumida y profesional.
-8. Guardado y actualización en Google Sheets: Si el usuario te solicita guardar, registrar o aplicar cambios en la hoja de cálculo o Google Sheets (por ejemplo: "guarda los cambios en sheets", "registra el teléfono en sheets"), utiliza la herramienta 'actualizar_registro_sheets' para aplicar los cambios directamente en la base de datos.""",
-    tools=[buscar_y_sanitizar_cliente, procesar_caso_zendesk, obtener_textos_de_archivos, actualizar_registro_sheets, buscar_clientes],
+8. Guardado y actualización en Google Sheets: Si el usuario te solicita guardar, registrar o aplicar cambios en la hoja de cálculo o Google Sheets (por ejemplo: "guarda los cambios en sheets", "registra el teléfono en sheets"), utiliza la herramienta 'actualizar_registro_sheets' para aplicar los cambios directamente en la base de datos.
+9. Validación de correo electrónico: Si el usuario te pide validar, verificar o comprobar si una dirección de correo electrónico es real, válida o entregable (o si necesitas validar un correo recuperado), utiliza la herramienta 'validar_correo'.""",
+    tools=[buscar_y_sanitizar_cliente, procesar_caso_zendesk, obtener_textos_de_archivos, actualizar_registro_sheets, buscar_clientes, validar_correo],
 )
 
