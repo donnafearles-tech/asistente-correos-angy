@@ -9,17 +9,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar el código del agente
-COPY . .
+# Copiar el código dentro del directorio asistente_correos para preservar el appName
+COPY . ./asistente_correos
 
 # Cloud Run inyecta PORT=8080 automáticamente
 ENV PORT=8080
 
-# Variables de entorno requeridas (se configuran en Cloud Run):
-# - GOOGLE_CLOUD_PROJECT: tu proyecto de GCP
-# - GOOGLE_CLOUD_LOCATION: región (ej. us-central1)
-# - BACKEND_URL: URL de tu servidor Node.js en Cloud Run
-#   (ej. https://customer-information-720693669884.us-central1.run.app)
-
-# Iniciar el servidor web del agente ADK en 0.0.0.0 usando el puerto de Cloud Run
-CMD python -m google.adk.cli web --host 0.0.0.0 --port $PORT .
+# Iniciar el servidor web del agente ADK especificando la carpeta asistente_correos
+CMD python -m google.adk.cli web --host 0.0.0.0 --port $PORT asistente_correos
