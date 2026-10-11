@@ -21,6 +21,39 @@ REGEX_PURCHASE_INFO = re.compile(r"purchase\s+inf[o0]rmati[o0]n", re.IGNORECASE)
 REGEX_TICKET_NOVA = re.compile(r"(?:_(?:n|nov)\b|[\s_-]n\.jpe?g$|\bnova\b|\binvoice[\s_-]*\d{4,6}\.jpe?g$)", re.IGNORECASE)
 REGEX_ID = re.compile(r"(?:^|[\s_-])(?:id|pass|passport|pp|dl|license)(?:[\s_.-]|$)", re.IGNORECASE)
 REGEX_EXCLUDED = re.compile(r"(?:gbk|5cc|50c|ccid|(?<![a-z])cid(?![a-z]))", re.IGNORECASE)
+REGEX_RETURN = re.compile(r"(?:^|[_\s.-])(?:r|ret|returns?|refunds?|devoluci[oó]n)(?:[_\s.-]\d*|\d+|$)", re.IGNORECASE)
+
+
+def sanitizar_producto_devolucion(nombre: str) -> str:
+    """
+    Sanitiza el nombre de un producto devuelto o negativo eliminando:
+    - Signos aritméticos (+, -, parentesis)
+    - Cantidades negativas (-1, -2, Qty -1)
+    - Precios (-$100.00, $ -50.00)
+    - Códigos de producto, IDs y SKUs (ID-12345, SKU 99, ITEM #12)
+    """
+    if not nombre:
+        return ""
+    s = str(nombre).strip()
+    s = re.sub(r"\(\s*-\s*\$?\s*\d+(?:\.\d+)?\s*\)", "", s)
+    s = re.sub(r"\(\s*\$?\s*\d+(?:\.\d+)?\s*-\s*\)", "", s)
+    s = re.sub(r"\(\s*-\s*\d+\s*\)", "", s)
+    s = re.sub(r"-\s*\$\s*\d+(?:\.\d+)?", "", s)
+    s = re.sub(r"\$\s*-\s*\d+(?:\.\d+)?", "", s)
+    s = re.sub(r"\$\s*\d+(?:\.\d+)?", "", s)
+    s = re.sub(r"^[+-]\s*\d+\s*(?:x|ea|pc)?\s*", "", s, flags=re.I)
+    s = re.sub(r"\b(?:qty|cant|cantidad)\s*[:x-]?\s*-?\d+\b", "", s, flags=re.I)
+    s = re.sub(r"\b(?:price|precio|total|subtotal|amount)\b[^\n]*", "", s, flags=re.I)
+    s = re.sub(r"\b(?:ID|SKU|REF|ITEM|CODE|COD|ART)[-:\s#]*[A-Za-z0-9_-]+\b", "", s, flags=re.I)
+    s = re.sub(r"\bID-\d+\b", "", s, flags=re.I)
+    s = re.sub(r"#\s*\d+\b", "", s)
+    s = re.sub(r"\b\d{6,}\b", "", s)
+    s = re.sub(r"^[-+*•±/\\–—\s\"'`]+", "", s)
+    s = re.sub(r"[-+*•±/\\–—\s\"'`]+$", "", s)
+    s = re.sub(r"[:;|,]+$", "", s)
+    s = re.sub(r"\([^)]*\)", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
 def clasificar_archivo_nomenclatura(file_name: str, text: str = "", is_letter_size: bool = None) -> dict:
@@ -33,9 +66,12 @@ def clasificar_archivo_nomenclatura(file_name: str, text: str = "", is_letter_si
     has_purchase_info = bool(REGEX_PURCHASE_INFO.search(raw_text))
     letter_ok = True if is_letter_size is None else bool(is_letter_size)
     is_purchase_info_shipping_doc = has_purchase_info and letter_ok
+    is_return_doc = bool(REGEX_RETURN.search(fname)) or fname.lower().endswith("_r.jpg") or fname.lower().endswith("-r.jpg")
 
     if REGEX_EXCLUDED.search(fname):
         categoria = "EXCLUIDO_EMPRESA_DEUDOR (GBK/5CC/50C/CID)"
+    elif is_return_doc:
+        categoria = "DEVOLUCION_RETURN (_R / RETURN)"
     elif REGEX_VIP.search(fname) or "vip" in fname.lower():
         categoria = "VIP_FORM (_V / VIP)"
     elif REGEX_SHIPPING.search(fname):
@@ -54,6 +90,7 @@ def clasificar_archivo_nomenclatura(file_name: str, text: str = "", is_letter_si
         "isLetterSize": is_letter_size,
         "hasPurchaseInformation": has_purchase_info,
         "isPurchaseInfoShippingDoc": is_purchase_info_shipping_doc,
+        "isReturnDocument": is_return_doc,
     }
 
 
@@ -703,6 +740,97 @@ def validar_correo(email: str) -> dict:
     except Exception as e:
         return {"error": f"Error de conexión al validar correo: {str(e)}"}
 
+def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
+    """
+    Analiza una relación N:1 donde N facturas (invoices) pertenecen a 1 mismo cliente.
+    Examina los archivos de ShareFile y OCR para cada factura, detectando:
+    1. Si contiene archivo de devolución (_R.jpg, RETURN.jpg, etc.) o productos/saldos negativos.
+    2. Sanitiza los productos devueltos eliminando signos aritméticos (+, -, parentesis) e IDs/SKUs.
+    3. Determina cuál es la factura de devolución que debe enviarse a MASTER SHIPPINGS y cuáles se omiten de MASTER SHIPPINGS (quedando solo en Customer Information).
+    """
+    if isinstance(invoices, str):
+        invoices_list = [inv.strip() for inv in re.split(r"[\s,;\n]+", invoices) if inv.strip()]
+    elif isinstance(invoices, list):
+        invoices_list = [str(inv).strip() for inv in invoices if str(inv).strip()]
+    else:
+        return {"error": "Formato de invoices no válido. Proporciona una lista o string de números de invoice."}
+
+    if not invoices_list:
+        return {"error": "No se proporcionaron facturas para analizar."}
+
+    resultados_invoices = []
+    invoice_devolucion_seleccionada = None
+    productos_devueltos_sanitizados = []
+
+    for inv in invoices_list:
+        scan_res = obtener_textos_de_archivos(inv)
+        tiene_archivo_retorno = False
+        archivos_detectados = []
+        raw_negative_products = []
+
+        if isinstance(scan_res, dict) and scan_res.get("files"):
+            for f in scan_res.get("files", []):
+                fname = f.get("fileName") or f.get("name") or ""
+                clasif = clasificar_archivo_nomenclatura(fname, f.get("fullText", ""))
+                es_retorno = clasif.get("isReturnDocument", False)
+                if es_retorno:
+                    tiene_archivo_retorno = True
+
+                # Buscar números negativos o keywords de retorno en OCR
+                ftext = f.get("fullText", "")
+                if re.search(r"-\s*\$?\d+|\(\$?\d+\)|-\s*\d+\s*(?:x|ea|pc)?|\b(?:refund|return|devoluci[oó]n)\b", ftext, re.I):
+                    for line in ftext.splitlines():
+                        if re.search(r"-\s*\$?\d+|\(\$?\d+\)|-\s*\d+", line):
+                            san = sanitizar_producto_devolucion(line)
+                            if san and len(san) >= 3:
+                                raw_negative_products.append(san)
+
+                archivos_detectados.append({
+                    "nombre": fname,
+                    "categoria": clasif.get("categoria"),
+                    "es_devolucion": es_retorno
+                })
+
+        # También verificar productos devueltos extraídos
+        if isinstance(scan_res, dict) and scan_res.get("extractedData"):
+            ext = scan_res.get("extractedData", {})
+            ret_prods = ext.get("returnProducts") or ext.get("returnProductsList") or []
+            if isinstance(ret_prods, list):
+                for rp in ret_prods:
+                    san = sanitizar_producto_devolucion(str(rp))
+                    if san:
+                        raw_negative_products.append(san)
+
+        # Sanitizar y deduplicar productos de retorno
+        prods_sanitizados = list(dict.fromkeys([p for p in raw_negative_products if p]))
+
+        es_candidato_master = tiene_archivo_retorno or len(prods_sanitizados) > 0
+        if es_candidato_master and not invoice_devolucion_seleccionada:
+            invoice_devolucion_seleccionada = inv
+            productos_devueltos_sanitizados = prods_sanitizados
+
+        resultados_invoices.append({
+            "invoice": inv,
+            "tiene_archivo_retorno_r": tiene_archivo_retorno,
+            "productos_negativos_detectados": prods_sanitizados,
+            "debe_ir_a_master_shippings": es_candidato_master,
+            "archivos": archivos_detectados
+        })
+
+    # Si ninguno tuvo _R.jpg ni negativos, seleccionar la primera para MASTER SHIPPINGS
+    if not invoice_devolucion_seleccionada and resultados_invoices:
+        invoice_devolucion_seleccionada = resultados_invoices[0]["invoice"]
+
+    return {
+        "relacion": "N:1 (Varios Invoices pertenecen a 1 Cliente)",
+        "total_invoices_analizados": len(invoices_list),
+        "invoice_seleccionado_para_master_shippings": invoice_devolucion_seleccionada,
+        "productos_devueltos_sanitizados_para_columna_m": productos_devueltos_sanitizados,
+        "regla_aplicada": f"Solo el invoice '{invoice_devolucion_seleccionada}' se envía a MASTER SHIPPINGS con productos sanitizados sin signos aritméticos ni IDs. Los demás invoices se registran únicamente en Customer Information.",
+        "detalle_por_invoice": resultados_invoices
+    }
+
+
 root_agent = Agent(
     model='gemini-2.5-flash',
     name='root_agent',
@@ -720,6 +848,7 @@ Sigue estrictamente estas reglas al responder preguntas, procesar archivos o uti
 2. REGLAS OFICIALES DE NOMENCLATURA REGEX:
    - **VIP (`_V`, `VIP`)**: Fuente #1 de verdad para **Email** y **Teléfono** del cliente.
    - **SHIPPING (`shipping.jpg`, `shipping form.jpg`) o Documento Tamaño Carta con `"Purchase information"`**: Fuente #1 de verdad para extraer **`Address 1 (Street)`**, **`City`**, **`Sales rep`** y **`Country`**.
+   - **DEVOLUCIÓN (`_R.jpg`, `R.jpg`, `RETURN.jpg`, `_r.jpg`)**: Archivos de retorno/reembolso para **MASTER SHIPPINGS**.
    - **PRIORIDAD ESTRICTA DE `Country`**: El `Country` extraído explícitamente del documento Shipping / `"Purchase information"` tiene **PRIORIDAD #1 ABSOLUTA** sobre el método de deducción por número de teléfono o código postal.
    - **TICKET DE COMPRA (`n.jpg`, `_n`, `_nov`, `nova`, `invoice_XXXXX.jpg`)**: Fuente prioritaria para **`SALE DATE`**, **`Sales rep`**, **`Location - Store`** y **`Productos`**.
    - **IDENTIDAD (`_id.jpg`, `pass`, `pp`, `id`)**: Prioritario para verificar ortografía de Nombre y Apellido manuscritos.
@@ -763,10 +892,20 @@ Incluye SOLO los campos que el usuario quiere modificar.
    - Para asignar o actualizar el `external_id` en Zendesk según el invoice:
      * Si el usuario existe en Zendesk y no tiene el `external_id` o difiere del invoice, utiliza `actualizar_usuario_zendesk` o `sincronizar_usuario_con_zendesk(invoice)`.
      * Si el usuario solo proporciona el invoice, obtén sus datos con `buscar_y_sanitizar_cliente(invoice)` o `sincronizar_usuario_con_zendesk(invoice)`.
-     * Responde de forma clara indicando el ID del usuario en Zendesk, su nombre, email y el estado de la asignación del `external_id`.""",
+     * Responde de forma clara indicando el ID del usuario en Zendesk, su nombre, email y el estado de la asignación del `external_id`.
+
+10. RELACIÓN N:1 (VARIAS FACTURAS A UN CLIENTE) Y REGLA DE DEVOLUCIONES A MASTER SHIPPINGS:
+    - En situaciones donde dos, tres o más números de factura (invoices) pertenecen a la **misma persona / cliente** (relación N:1 donde "1" es el cliente):
+      * **NUNCA envíes todas las facturas a MASTER SHIPPINGS**.
+      * **SOLO se envía a MASTER SHIPPINGS la factura que contiene el archivo de devolución (`_R.jpg`, `R.jpg`, `RETURN.jpg`, `_r.jpg`) o productos/cantidades en negativo**.
+      * Las facturas estándar de compra (sin devolución) se registran únicamente en **Customer Information - Shippings**.
+      * **Casos límite (múltiples invoices en la carpeta)**: Si el usuario o el sistema proveen 2 números pero en la carpeta existen 3 o más, Angy y la app deben inspeccionar los archivos e identificar con precisión cuál es el número de invoice con la devolución negativa.
+      * **Sanitización estricta de productos en Columna M de MASTER SHIPPINGS**: Todos los productos devueltos deben limpiarse completamente sin signos aritméticos (`-`, `+`, `(-1)`, `-$`), sin cantidades ni IDs/SKUs/códigos de barras (`ID-XXXX`, `#123`). Únicamente nombres puros y limpios del producto.
+      * Utiliza `analizar_multiples_invoices_devolucion` para inspeccionar y clasificar automáticamente el lote de facturas de un cliente.""",
     tools=[
         buscar_y_sanitizar_cliente,
         consultar_productos_pendientes,
+        analizar_multiples_invoices_devolucion,
         procesar_caso_zendesk,
         consultar_usuario_zendesk,
         actualizar_usuario_zendesk,
