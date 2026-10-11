@@ -38,6 +38,7 @@ def sanitizar_producto_devolucion(nombre: str) -> str:
         return ""
     s = str(nombre).strip()
     s = re.sub(r"^[A-Za-z0-9_-]+\.(?:jpe?g|png|pdf|tiff?)\s*[-–—:]*\s*", "", s, flags=re.I)
+    s = re.sub(r"^(?:return|refund|devoluci[oó]n|void|exchange)\s*[:–—-]?\s*", "", s, flags=re.I)
     s = re.sub(r"\(\s*-\s*\$?\s*\d+(?:\.\d+)?\s*\)", "", s)
     s = re.sub(r"\(\s*\$?\s*\d+(?:\.\d+)?\s*-\s*\)", "", s)
     s = re.sub(r"\(\s*-\s*\d+\s*\)", "", s)
@@ -46,7 +47,7 @@ def sanitizar_producto_devolucion(nombre: str) -> str:
     s = re.sub(r"\$\s*\d+(?:\.\d+)?", "", s)
     s = re.sub(r"-\s*\d+(?:\.\d+)?", "", s)
     s = re.sub(r"\b\d+\.\d{2}\b", "", s)
-    s = re.sub(r"^[+-]\s*\d+\s*(?:x|ea|pc)?\s*", "", s, flags=re.I)
+    s = re.sub(r"^[+-]?\s*\d*\s*(?:x|ea|pc)\s*", "", s, flags=re.I)
     s = re.sub(r"\b(?:qty|cant|cantidad)\s*[:x-]?\s*-?\d+\b", "", s, flags=re.I)
     s = re.sub(r"\b(?:price|precio|total|subtotal|amount|tax|balance\s*due)\b[^\n]*", "", s, flags=re.I)
     s = re.sub(r"\b(?:ID|SKU|REF|ITEM|CODE|COD|ART)[-:\s#]*[A-Za-z0-9_-]*\b", "", s, flags=re.I)
@@ -869,9 +870,10 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
     """
     Analiza una relación N:1 donde N facturas (invoices) pertenecen a 1 mismo cliente.
     Examina los archivos de ShareFile y OCR para cada factura, detectando:
-    1. Si contiene archivo de devolución (_R.jpg, RETURN.jpg, etc.) o productos/saldos negativos.
-    2. Sanitiza los productos devueltos eliminando signos aritméticos (+, -, parentesis) e IDs/SKUs.
-    3. Determina cuál es la factura de devolución que debe enviarse a MASTER SHIPPINGS y cuáles se omiten de MASTER SHIPPINGS (quedando solo en Customer Information).
+    1. Si contiene archivo de devolución (_R.jpg, RETURN.jpg, etc.) o productos/saldos negativos en crudo (Raw OCR).
+    2. Autodetecta facturas adicionales presentes en la misma carpeta ganadora (ej. si se dan 2 facturas pero la carpeta contiene 3+).
+    3. Sanitiza los productos devueltos eliminando signos aritméticos (+, -, parentesis), precios e IDs/SKUs.
+    4. Determina cuál es la factura de devolución que debe enviarse a MASTER SHIPPINGS y cuáles se omiten de MASTER SHIPPINGS (quedando solo en Customer Information).
     """
     if isinstance(invoices, str):
         invoices_list = [inv.strip() for inv in re.split(r"[\s,;\n]+", invoices) if inv.strip()]
@@ -883,42 +885,89 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
     if not invoices_list:
         return {"error": "No se proporcionaron facturas para analizar."}
 
+    # Revisar si en la sesión activa de frontend hay invoices detectados adicionales
+    invoices_iniciales = list(dict.fromkeys(invoices_list))
+    invoices_a_procesar = list(invoices_iniciales)
+    try:
+        sesion = obtener_sesion_activa_frontend()
+        if sesion.get("hay_sesion_activa") or sesion.get("estado") == "exito":
+            sp = sesion.get("sesion_pantalla", {})
+            for inv_s in (sp.get("invoices_detectados") or []):
+                inv_str = str(inv_s).strip()
+                if inv_str and inv_str not in invoices_a_procesar:
+                    invoices_a_procesar.append(inv_str)
+    except Exception:
+        pass
+
     resultados_invoices = []
     invoice_devolucion_seleccionada = None
     productos_devueltos_sanitizados = []
+    invoices_descubiertos_en_carpeta = []
+    archivos_carpeta_ganadora = []
+    todos_los_archivos_carpeta = []
 
-    for inv in invoices_list:
+    procesados = set()
+    idx = 0
+    while idx < len(invoices_a_procesar):
+        inv = invoices_a_procesar[idx]
+        idx += 1
+        if inv in procesados:
+            continue
+        procesados.add(inv)
+
         scan_res = obtener_textos_de_archivos(inv)
         tiene_archivo_retorno = False
         archivos_detectados = []
         raw_negative_products = []
 
-        if isinstance(scan_res, dict) and scan_res.get("files"):
-            for f in scan_res.get("files", []):
+        if isinstance(scan_res, dict):
+            # Autodescubrimiento de otros invoices en la misma carpeta desde respuesta de la API
+            folder_invs = scan_res.get("allInvoicesInFolder") or []
+            for f_inv in folder_invs:
+                f_inv_str = str(f_inv).strip()
+                if f_inv_str and f_inv_str not in invoices_a_procesar:
+                    invoices_a_procesar.append(f_inv_str)
+                    if f_inv_str not in invoices_descubiertos_en_carpeta and f_inv_str not in invoices_iniciales:
+                        invoices_descubiertos_en_carpeta.append(f_inv_str)
+
+            files = scan_res.get("files") or []
+            for f in files:
                 fname = f.get("fileName") or f.get("name") or ""
-                clasif = clasificar_archivo_nomenclatura(fname, f.get("fullText", ""))
-                es_retorno = clasif.get("isReturnDocument", False)
+                ftext = f.get("text") or f.get("fullText") or ""
+                
+                # Autodescubrimiento de invoices en el nombre del archivo
+                fname_inv_matches = re.findall(r"(?:^|[_\s-])(\d{5,8})(?:[_\s.-]|$)", fname)
+                for f_m in fname_inv_matches:
+                    if f_m not in invoices_a_procesar:
+                        invoices_a_procesar.append(f_m)
+                        if f_m not in invoices_descubiertos_en_carpeta and f_m not in invoices_iniciales:
+                            invoices_descubiertos_en_carpeta.append(f_m)
+
+                clasif = clasificar_archivo_nomenclatura(fname, ftext)
+                es_retorno = clasif.get("isReturnDocument", False) or f.get("classifiedType") == "return" or is_return_file_name(fname)
                 if es_retorno:
                     tiene_archivo_retorno = True
 
-                # Buscar números negativos o keywords de retorno en OCR
-                ftext = f.get("fullText", "")
-                if re.search(r"-\s*\$?\d+|\(\$?\d+\)|-\s*\d+\s*(?:x|ea|pc)?|\b(?:refund|return|devoluci[oó]n)\b", ftext, re.I):
+                # FASE 1: Detección en CRUDO (Raw OCR) de líneas con signos negativos o marcas de retorno
+                if re.search(r"-\s*\$?\d+|\(\$?\d+\)|-\s*\d+\s*(?:x|ea|pc)?|(?:refund|return|devoluci[oó]n)", ftext, re.I) or es_retorno:
                     for line in ftext.splitlines():
-                        if re.search(r"-\s*\$?\d+|\(\$?\d+\)|-\s*\d+", line):
+                        if re.search(r"-\s*\$?\d+|\(\$?\d+\)|-\s*\d+|(?:refund|return|devoluci[oó]n)", line, re.I):
+                            # FASE 2: Sanitización posterior para la Columna M
                             san = sanitizar_producto_devolucion(line)
                             if san and len(san) >= 3:
                                 raw_negative_products.append(san)
 
-                archivos_detectados.append({
+                file_info = {
                     "nombre": fname,
-                    "categoria": clasif.get("categoria"),
-                    "es_devolucion": es_retorno
-                })
+                    "categoria": clasif.get("categoria") or f.get("classifiedType") or "other",
+                    "es_devolucion": es_retorno,
+                    "texto_crudo_snippet": ftext[:150] if ftext else ""
+                }
+                archivos_detectados.append(file_info)
+                todos_los_archivos_carpeta.append(file_info)
 
-        # También verificar productos devueltos extraídos
-        if isinstance(scan_res, dict) and scan_res.get("extractedData"):
-            ext = scan_res.get("extractedData", {})
+            # Verificar datos extraídos previamente
+            ext = scan_res.get("extractedData") or scan_res.get("extraidos") or {}
             ret_prods = ext.get("returnProducts") or ext.get("returnProductsList") or []
             if isinstance(ret_prods, list):
                 for rp in ret_prods:
@@ -937,46 +986,62 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
         resultados_invoices.append({
             "invoice": inv,
             "tiene_archivo_retorno_r": tiene_archivo_retorno,
-            "productos_negativos_detectados": prods_sanitizados,
+            "productos_negativos_detectados_sanitizados": prods_sanitizados,
             "debe_ir_a_master_shippings": es_candidato_master,
             "archivos": archivos_detectados
         })
 
+    # Si se detectó un invoice de retorno entre los archivos pero no coincidía con el invoice iterado
+    if not invoice_devolucion_seleccionada:
+        for r in resultados_invoices:
+            if r.get("tiene_archivo_retorno_r") or len(r.get("productos_negativos_detectados_sanitizados", [])) > 0:
+                invoice_devolucion_seleccionada = r["invoice"]
+                productos_devueltos_sanitizados = r["productos_negativos_detectados_sanitizados"]
+                break
+
+    # Si aún no se seleccionó, buscar si algún archivo de retorno contenía un invoice específico en su nombre
+    if not invoice_devolucion_seleccionada:
+        for af in todos_los_archivos_carpeta:
+            if af.get("es_devolucion"):
+                matches = re.findall(r"(?:^|[_\s-])(\d{5,8})(?:[_\s.-]|$)", af.get("nombre", ""))
+                if matches:
+                    invoice_devolucion_seleccionada = matches[0]
+                    break
+
     hay_devolucion = bool(invoice_devolucion_seleccionada)
     hay_productos_sanitizables = len(productos_devueltos_sanitizados) > 0
 
-    if not invoice_devolucion_seleccionada and resultados_invoices:
-        invoice_devolucion_seleccionada = None
-
-    # Obtener todos los archivos de la carpeta ganadora para procesarlos con la misma importancia
-    archivos_carpeta_ganadora = []
+    # Clasificar archivos de la carpeta ganadora
     tiene_shipping_file = False
     tiene_vip_file = False
     tiene_id_file = False
 
-    if invoice_devolucion_seleccionada:
-        for r in resultados_invoices:
-            if r["invoice"] == invoice_devolucion_seleccionada:
-                archivos_carpeta_ganadora = r.get("archivos", [])
-                for af in archivos_carpeta_ganadora:
-                    aname = (af.get("nombre") or "").lower()
-                    acat = af.get("categoria") or ""
-                    if acat == "shipping" or "shipping" in aname:
-                        tiene_shipping_file = True
-                    if acat == "vip" or "_v" in aname or "vip" in aname:
-                        tiene_vip_file = True
-                    if acat == "id" or "_id" in aname or "license" in aname or "passport" in aname:
-                        tiene_id_file = True
-                break
+    archivos_carpeta_ganadora = []
+    seen_fnames = set()
+    for af in todos_los_archivos_carpeta:
+        fname_k = af.get("nombre") or ""
+        if fname_k not in seen_fnames:
+            seen_fnames.add(fname_k)
+            archivos_carpeta_ganadora.append(af)
+            aname = fname_k.lower()
+            acat = af.get("categoria") or ""
+            if acat == "shipping" or "shipping" in aname:
+                tiene_shipping_file = True
+            if acat == "vip" or "_v" in aname or "vip" in aname:
+                tiene_vip_file = True
+            if acat == "id" or "_id" in aname or "license" in aname or "passport" in aname:
+                tiene_id_file = True
 
     return {
         "relacion": "N:1 (Varios Invoices pertenecen a 1 Cliente)",
-        "total_invoices_analizados": len(invoices_list),
+        "invoices_solicitados": invoices_iniciales,
+        "invoices_descubiertos_en_carpeta": invoices_descubiertos_en_carpeta,
+        "total_invoices_analizados": len(resultados_invoices),
         "hay_devolucion": hay_devolucion,
         "hay_productos_sanitizables": hay_productos_sanitizables,
         "invoice_seleccionado_para_master_shippings": invoice_devolucion_seleccionada,
         "invoice_con_devolucion": invoice_devolucion_seleccionada,
-        "carpeta_ganadora": invoice_devolucion_seleccionada,
+        "carpeta_ganadora": invoice_devolucion_seleccionada or (invoices_iniciales[0] if invoices_iniciales else ""),
         "archivos_carpeta_ganadora": archivos_carpeta_ganadora,
         "tiene_shipping_en_carpeta_ganadora": tiene_shipping_file,
         "tiene_vip_en_carpeta_ganadora": tiene_vip_file,
@@ -984,11 +1049,13 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
         "productos_devueltos_sanitizados": productos_devueltos_sanitizados,
         "productos_devueltos_sanitizados_para_columna_m": productos_devueltos_sanitizados,
         "regla_aplicada": (
-            f"Solo el invoice de devolución '{invoice_devolucion_seleccionada}' se envía a MASTER SHIPPINGS con productos sanitizados "
+            f"Se analizaron {len(resultados_invoices)} facturas de la carpeta ganadora (solicitadas: {', '.join(invoices_iniciales)}"
+            + (f"; adicionales descubiertas: {', '.join(invoices_descubiertos_en_carpeta)}" if invoices_descubiertos_en_carpeta else "")
+            + f"). Solo la factura con devolución/saldo negativo '{invoice_devolucion_seleccionada}' se envía a MASTER SHIPPINGS con productos sanitizados "
             f"({', '.join(productos_devueltos_sanitizados) if hay_productos_sanitizables else 'sin productos específicos sanitizables'}). "
-            f"Todos los archivos de la carpeta ganadora ({len(archivos_carpeta_ganadora)} archivos) se procesan con la misma importancia (VIP, Shipping, ID y Devolución). "
-            f"Los demás invoices se registran únicamente en Customer Information."
-        ) if hay_devolucion else "Ninguna de las facturas presenta archivos de devolución (_R.jpg / RETURN.jpg) ni cantidades negativas.",
+            f"Todos los archivos de la carpeta ({len(archivos_carpeta_ganadora)} archivos) se procesan con la misma importancia (VIP, Shipping, ID y Devolución). "
+            f"Las demás facturas se registran únicamente en Customer Information."
+        ) if hay_devolucion else f"Se analizaron {len(resultados_invoices)} facturas ({', '.join(invoices_a_procesar)}). Ninguna presenta archivos de devolución (_R.jpg) ni saldos negativos.",
         "detalle_por_invoice": resultados_invoices
     }
 
@@ -1105,14 +1172,15 @@ Incluye SOLO los campos que el usuario quiere modificar.
     - En situaciones donde dos, tres o más números de factura (invoices) pertenecen a la **misma persona / cliente** (relación N:1 donde "1" es el cliente):
       * **NUNCA envíes todas las facturas a MASTER SHIPPINGS**.
       * **SOLO se envía a MASTER SHIPPINGS la factura que contiene el archivo de devolución (`_R.jpg`, `R.jpg`, `RETURN.jpg`, `_r.jpg`) o productos/cantidades con signo menos `-`**.
-      * **PROCESAMIENTO EXHAUSTIVO DE LA CARPETA GANADORA**: La carpeta del invoice ganador debe incluir todos los nuevos y preexistentes archivos encontrados y procesarlos con la **misma importancia jerárquica**:
+      * **DETECCIÓN EN CRUDO PREVIA A SANITIZACIÓN**: La detección de si un invoice contiene una devolución o saldo negativo se realiza OBLIGATORIAMENTE en crudo (Raw OCR y metadatos binarios) buscando líneas con `-`, `-$`, `-$XX.XX`, `($XX)`, `-1`, `Refund`, `Return` o el archivo binario `_R.jpg` ANTES de que cualquier sanitización limpie los signos.
+      * **AUTODETECCIÓN Y NO-NEGACIÓN DE INVOICES EN CARPETA**: Si el usuario proporciona 2 facturas y en la carpeta ganadora de ShareFile se descubren 3 o más facturas (ej. `233145`), NUNCA niegues su existencia ni digas que "no hay nada". Agrégalas de inmediato al análisis, escanea todos sus archivos binarios y reporta el conjunto completo con total transparencia.
+      * **PROCESAMIENTO EXHAUSTIVO DE LA CARPETA GANADORA**: La carpeta del invoice ganador debe incluir todos los archivos (nuevos y existentes) y procesarlos con la **misma importancia jerárquica**:
         - **Archivos VIP (`_v.jpg`, `_V`, `VIP`)**: Fuente maestra y máxima prioridad para nombre, email y teléfono.
         - **Archivos de Devolución (`_R.jpg`, `RETURN.jpg`, `-`)**: Extracción de productos devueltos sanitizados (sin signos +, -, $, cantidades ni SKUs/IDs).
         - **Archivos de Envío (`Shipping.jpg`, `shipping form.jpg`)**: Validación para habilitar el guardado/envío a MASTER SHIPPINGS.
         - **Archivos de Identificación (`_id.jpg`, `license`, `passport`) y Documentos Nuevos**: Cotejo ortográfico de nombres manuscritos, firmas, direcciones y detalles adicionales.
       * Se debe tomar **específicamente ese número de invoice con saldo negativo** para crear la fila nueva en **MASTER SHIPPINGS** (antes del banner `DEFECTIVE DEVICES...`).
       * Las facturas estándar de compra (sin devolución) se registran únicamente en **Customer Information - Shippings**.
-      * **Casos límite (múltiples invoices en la carpeta)**: Si el usuario o el sistema proveen 2 números pero en la carpeta existen 3 o más, Angy y la app deben inspeccionar los archivos e identificar con precisión cuál es el número de invoice con la devolución negativa.
       * **Sanitización estricta de productos en Columna M de MASTER SHIPPINGS**: Todos los productos devueltos deben limpiarse completamente sin signos aritméticos (`-`, `+`, `(-1)`, `-$`), sin cantidades ni IDs/SKUs/códigos de barras (`ID-XXXX`, `#123`). Únicamente nombres puros y limpios del producto.
       * Utiliza `analizar_multiples_invoices_devolucion` para inspeccionar y clasificar automáticamente el lote de facturas de un cliente y todos los archivos de la carpeta ganadora.
 
