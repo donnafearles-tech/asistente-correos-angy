@@ -161,6 +161,166 @@ def procesar_caso_zendesk(invoice: str, nombre: str, email: str, telefono: str, 
     except Exception as e:
         return {"error": f"Error de conexión al procesar Zendesk: {str(e)}"}
 
+def consultar_usuario_zendesk(email: str = None, telefono: str = None, nombre: str = None, invoice: str = None) -> dict:
+    """
+    Consulta si un cliente/usuario existe en Zendesk buscando por correo electrónico, teléfono, nombre o número de invoice (external_id).
+    Devuelve los datos del perfil en Zendesk (ID, nombre, email, teléfono, external_id, zona horaria y estado).
+    """
+    clean_email = str(email or "").strip().lower() if email else None
+    
+    clean_phone = None
+    if telefono:
+        raw_digits = "".join(filter(str.isdigit, str(telefono)))
+        if len(raw_digits) > 10:
+            raw_digits = raw_digits[-10:]
+        if raw_digits not in COMPANY_PHONES and len(raw_digits) >= 10:
+            clean_phone = raw_digits
+
+    clean_name = str(nombre or "").strip() if nombre else None
+    clean_inv = str(invoice or "").strip() if invoice else None
+
+    if not clean_email and not clean_phone and not clean_name and not clean_inv:
+        return {"error": "Debes proporcionar al menos un criterio para buscar en Zendesk: email, teléfono, nombre o invoice."}
+
+    url = f"{BACKEND_URL}/api/zendesk/check-user"
+    payload = {}
+    if clean_email: payload["email"] = clean_email
+    if clean_phone: payload["phone"] = clean_phone
+    if clean_name: payload["name"] = clean_name
+    if clean_inv: payload["invoice"] = clean_inv
+
+    try:
+        response = requests.post(url, json=payload, timeout=20)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("exists"):
+                return {
+                    "existe_en_zendesk": True,
+                    "id": data.get("id"),
+                    "name": data.get("name"),
+                    "email": data.get("email"),
+                    "phone": data.get("phone"),
+                    "external_id": data.get("external_id"),
+                    "time_zone": data.get("time_zone"),
+                    "detalles": data.get("details", {})
+                }
+            else:
+                return {
+                    "existe_en_zendesk": False,
+                    "mensaje": f"No se encontró ningún usuario en Zendesk con los criterios especificados (email: {clean_email}, teléfono: {clean_phone}, nombre: {clean_name}, invoice: {clean_inv})."
+                }
+        return {"error": f"Error al consultar usuario en Zendesk. Código: {response.status_code}, Detalle: {response.text}"}
+    except Exception as e:
+        return {"error": f"Error de conexión con Zendesk: {str(e)}"}
+
+def actualizar_usuario_zendesk(
+    user_id: int,
+    external_id_invoice: str = None,
+    nombre: str = None,
+    telefono: str = None,
+    zona_horaria: str = None,
+    tienda: str = None,
+    region: str = None,
+    comentario: str = None
+) -> dict:
+    """
+    Actualiza el perfil de un usuario existente en Zendesk por su User ID.
+    Permite asignar el número de invoice como 'external_id', así como actualizar nombre, teléfono, zona horaria, tienda, región o notas.
+    """
+    if not user_id:
+        return {"error": "Se requiere el 'user_id' de Zendesk para actualizar el usuario."}
+
+    url = f"{BACKEND_URL}/api/zendesk/update-user"
+    payload = {"userId": user_id}
+    
+    if external_id_invoice:
+        payload["invoice"] = str(external_id_invoice).strip()
+    if nombre:
+        payload["name"] = str(nombre).strip()
+    if telefono:
+        clean_phone = "".join(filter(str.isdigit, str(telefono)))
+        if len(clean_phone) > 10:
+            clean_phone = clean_phone[-10:]
+        if clean_phone in COMPANY_PHONES:
+            return {"error": "No se puede actualizar el teléfono: Es el número corporativo de la empresa (8882494189)."}
+        payload["phone"] = clean_phone
+    if zona_horaria:
+        payload["time_zone"] = zona_horaria
+    if tienda:
+        payload["store_location"] = tienda
+    if region:
+        payload["region"] = region
+    if comentario:
+        payload["comment"] = comentario
+
+    try:
+        response = requests.post(url, json=payload, timeout=20)
+        if response.status_code == 200:
+            return response.json()
+        return {"error": f"Error al actualizar usuario en Zendesk. Código: {response.status_code}, Detalle: {response.text}"}
+    except Exception as e:
+        return {"error": f"Error de conexión al actualizar en Zendesk: {str(e)}"}
+
+def sincronizar_usuario_con_zendesk(
+    invoice: str,
+    email: str = None,
+    telefono: str = None,
+    nombre: str = None
+) -> dict:
+    """
+    Busca al usuario en Zendesk por email, teléfono o nombre (obteniendo los datos del invoice si no se especifican)
+    y le asigna automáticamente el número de invoice como 'external_id' en su perfil de Zendesk.
+    """
+    clean_inv = str(invoice or "").strip()
+    c_email = email
+    c_phone = telefono
+    c_name = nombre
+
+    # Si falta información, consultar registro de cliente de Sheets
+    if not (c_email and c_phone and c_name) and clean_inv:
+        cliente_info = buscar_y_sanitizar_cliente(clean_inv)
+        if "error" not in cliente_info:
+            if not c_email and cliente_info.get("email_sanitizado"):
+                c_email = cliente_info.get("email_sanitizado")
+            if not c_phone and cliente_info.get("telefono_sanitizado"):
+                c_phone = cliente_info.get("telefono_sanitizado")
+            if not c_name and cliente_info.get("nombre"):
+                c_name = f"{cliente_info.get('nombre', '')} {cliente_info.get('apellido', '')}".strip()
+
+    # Consultar si existe en Zendesk
+    busqueda = consultar_usuario_zendesk(email=c_email, telefono=c_phone, nombre=c_name, invoice=clean_inv)
+    if "error" in busqueda:
+        return busqueda
+
+    if not busqueda.get("existe_en_zendesk"):
+        return {
+            "success": False,
+            "existe_en_zendesk": False,
+            "mensaje": f"El usuario correspondiente a la factura {clean_inv} no existe en Zendesk.",
+            "datos_buscados": {"email": c_email, "telefono": c_phone, "nombre": c_name, "invoice": clean_inv}
+        }
+
+    user_id = busqueda.get("id")
+    external_id_actual = busqueda.get("external_id")
+
+    # Si ya tiene el external_id asignado
+    if str(external_id_actual or "").strip() == clean_inv:
+        return {
+            "success": True,
+            "actualizado": False,
+            "mensaje": f"El usuario {busqueda.get('name')} (ID: {user_id}) ya tiene asignado el external_id '{clean_inv}'.",
+            "user": busqueda
+        }
+
+    # Asignar external_id
+    res_update = actualizar_usuario_zendesk(user_id=user_id, external_id_invoice=clean_inv)
+    return {
+        "success": True,
+        "actualizado": True,
+        "mensaje": f"Se asignó exitosamente el external_id '{clean_inv}' al usuario {busqueda.get('name')} (ID: {user_id}) en Zendesk.",
+        "resultado_zendesk": res_update
+    }
+
 def obtener_textos_de_archivos(invoice: str) -> dict:
     """
     Busca todos los archivos (VIP, Shipping, Tamaño Carta con 'Purchase information', Ticket _N, ID, etc.)
@@ -508,10 +668,22 @@ Incluye SOLO los campos que el usuario quiere modificar.
 8. Consulta de Productos Pendientes por Enviar:
    - Cuando el usuario te pregunte "cuáles son los productos pendientes por enviar" (o qué productos faltan/están pendientes de envío para una factura o cliente), tu fuente directa de verdad es la columna **`PRODUCTS`** (Columna M de **MASTER SHIPPINGS**).
    - Consulta el registro usando `buscar_y_sanitizar_cliente(invoice)` o `buscar_clientes`.
-   - Extrae el campo `productos` / columna M de MASTER SHIPPINGS y lista al usuario cada producto pendiente de forma clara, limpia y ordenada. Si la columna está vacía o no tiene productos registrados, indícale amablemente que no hay productos pendientes registrados en MASTER SHIPPINGS.""",
+   - Extrae el campo `productos` / columna M de MASTER SHIPPINGS y lista al usuario cada producto pendiente de forma clara, limpia y ordenada. Si la columna está vacía o no tiene productos registrados, indícale amablemente que no hay productos pendientes registrados en MASTER SHIPPINGS.
+
+9. Búsqueda y Asignación de External ID en Zendesk:
+   - Cuando el usuario pregunte si un cliente existe en Zendesk (o pida buscar por correo, teléfono o nombre):
+     * Utiliza `consultar_usuario_zendesk` o `sincronizar_usuario_con_zendesk`.
+     * Prioriza siempre la búsqueda por **Email** (fuente VIP de verdad), luego por **Teléfono** (sanitizado de 10 dígitos, omitiendo números corporativos de la empresa como 8882494189) y por **Nombre**.
+   - Para asignar o actualizar el `external_id` en Zendesk según el invoice:
+     * Si el usuario existe en Zendesk y no tiene el `external_id` o difiere del invoice, utiliza `actualizar_usuario_zendesk` o `sincronizar_usuario_con_zendesk(invoice)`.
+     * Si el usuario solo proporciona el invoice, obtén sus datos con `buscar_y_sanitizar_cliente(invoice)` o `sincronizar_usuario_con_zendesk(invoice)`.
+     * Responde de forma clara indicando el ID del usuario en Zendesk, su nombre, email y el estado de la asignación del `external_id`.""",
     tools=[
         buscar_y_sanitizar_cliente,
         procesar_caso_zendesk,
+        consultar_usuario_zendesk,
+        actualizar_usuario_zendesk,
+        sincronizar_usuario_con_zendesk,
         obtener_textos_de_archivos,
         escanear_y_rellenar_master_shippings,
         actualizar_registro_sheets,
