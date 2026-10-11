@@ -2,6 +2,9 @@ import os
 import requests
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "TRUE"
 
+import json
+import urllib.request
+import urllib.parse
 from google.adk.agents.llm_agent import Agent
 
 # URL del backend Node.js (auto-detecta si está en Cloud Run o local)
@@ -28,44 +31,161 @@ def sanitizar_producto_devolucion(nombre: str) -> str:
     """
     Sanitiza el nombre de un producto devuelto o negativo eliminando:
     - Signos aritméticos (+, -, parentesis)
-    - Cantidades negativas (-1, -2, Qty -1)
+    - Cantidades negativas (-1, -2, Qty -1, (-1))
     - Precios (-$100.00, $ -50.00, -150.00)
     - Prefijos de nombres de archivo (ej. EMPIRETECHSSA4_233145_R.jpg - )
+    - Prefijos de cabeceras de devolución (RETURNED:, REFUNDED:, etc.)
     - Códigos de producto, IDs y SKUs (ID-12345, SKU 99, ITEM #12)
     - Palabras genéricas aisladas de totales o cabeceras
     """
     if not nombre:
         return ""
     s = str(nombre).strip()
+    
+    # 1. Eliminar prefijos de archivos comunes
     s = re.sub(r"^[A-Za-z0-9_-]+\.(?:jpe?g|png|pdf|tiff?)\s*[-–—:]*\s*", "", s, flags=re.I)
-    s = re.sub(r"^(?:return|refund|devoluci[oó]n|void|exchange)\s*[:–—-]?\s*", "", s, flags=re.I)
+    
+    # 2. Eliminar prefijos de cabeceras de devolución / retorno
+    s = re.sub(
+        r"^(?:returned\s+items?|refunded\s+items?|return\s+items?|productos?\s+devueltos?|items?\s+retornados?|returned|refunded|return|refund|devoluci[oó]n|retorno|void|exchange|cambio)\s*[:–—-]*\s*",
+        "",
+        s,
+        flags=re.I
+    )
+    
+    # 3. Eliminar paréntesis con signo negativo, precios o cantidades
     s = re.sub(r"\(\s*-\s*\$?\s*\d+(?:\.\d+)?\s*\)", "", s)
     s = re.sub(r"\(\s*\$?\s*\d+(?:\.\d+)?\s*-\s*\)", "", s)
-    s = re.sub(r"\(\s*-\s*\d+\s*\)", "", s)
+    s = re.sub(r"\(\s*-\s*\d+\s*(?:x|ea|pc|units?|unidades?)?\s*\)", "", s, flags=re.I)
+    s = re.sub(r"\(\s*(?:qty|cant|cantidad|retornar|retorno)\s*[:x-]?\s*-?\d+[^)]*\)", "", s, flags=re.I)
+    s = re.sub(r"\(\s*cantidad\s*-\s*\d+[^)]*\)", "", s, flags=re.I)
+    
+    # 4. Eliminar importes y precios negativos o positivos
     s = re.sub(r"-\s*\$\s*\d+(?:\.\d+)?", "", s)
     s = re.sub(r"\$\s*-\s*\d+(?:\.\d+)?", "", s)
     s = re.sub(r"\$\s*\d+(?:\.\d+)?", "", s)
-    s = re.sub(r"-\s*\d+(?:\.\d+)?", "", s)
     s = re.sub(r"\b\d+\.\d{2}\b", "", s)
-    s = re.sub(r"^[+-]?\s*\d*\s*(?:x|ea|pc)\s*", "", s, flags=re.I)
-    s = re.sub(r"\b(?:qty|cant|cantidad)\s*[:x-]?\s*-?\d+\b", "", s, flags=re.I)
-    s = re.sub(r"\b(?:price|precio|total|subtotal|amount|tax|balance\s*due)\b[^\n]*", "", s, flags=re.I)
+    
+    # 5. Eliminar cantidades y unidades negativas o normales al inicio/final
+    s = re.sub(r"^[+-]?\s*\d*\s*(?:x|ea|pc|units?|unidades?)\s*", "", s, flags=re.I)
+    s = re.sub(r"^[+-]\s*\d+\s*", "", s)
+    s = re.sub(r"\b(?:qty|cant|cantidad|retornar|retorno)\s*[:x-]?\s*-?\d+\b", "", s, flags=re.I)
+    s = re.sub(r"[-–—]\s*\d+\s*(?:x|ea|pc|units?|unidades?)?\s*$", "", s, flags=re.I)
+    
+    # 6. Eliminar totales, subtotales, impuestos y balance
+    s = re.sub(r"\b(?:price|precio|total|subtotal|sub-total|amount|tax|balance\s*due)\b[^\n]*", "", s, flags=re.I)
+    
+    # 7. Eliminar IDs, SKUs, referencias numéricas
     s = re.sub(r"\b(?:ID|SKU|REF|ITEM|CODE|COD|ART)[-:\s#]*[A-Za-z0-9_-]*\b", "", s, flags=re.I)
     s = re.sub(r"#\s*\d+\b", "", s)
     s = re.sub(r"\b\d{6,}\b", "", s)
-    s = re.sub(r"^[-+*•±/\\–—\s\"'`]+", "", s)
-    s = re.sub(r"[-+*•±/\\–—\s\"'`]+$", "", s)
-    s = re.sub(r"[:;|,]+$", "", s)
+    
+    # 8. Eliminar cualquier otro paréntesis residual
     s = re.sub(r"\([^)]*\)", "", s)
-    s = re.sub(r"^[-+*•±/\\–—\s\"'`]+", "", s)
-    s = re.sub(r"[-+*•±/\\–—\s\"'`]+$", "", s)
+    
+    # 9. Limpiar símbolos y signos al inicio y al final
+    s = re.sub(r"^[-+*•±/\\–—\s\"'`.:;|,]+", "", s)
+    s = re.sub(r"[-+*•±/\\–—\s\"'`.:;|,]+$", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     
-    # Si lo que quedó es una palabra clave genérica o demasiado corta (< 3 caracteres), descartar
-    if len(s) < 3 or s.lower() in ["return", "refund", "returns", "refunds", "devolucion", "devolución", "void", "cancel", "cambio", "exchange"]:
+    # 10. Descartar si es solo una palabra clave genérica o demasiado corta
+    palabras_invalidas = {
+        "return", "refund", "returns", "refunds", "devolucion", "devolución",
+        "void", "cancel", "cambio", "exchange", "item", "items", "producto",
+        "productos", "total", "subtotal", "tax", "date", "customer", "signature",
+        "visa", "mastercard", "amex", "cash", "credit", "debit", "sale", "invoice"
+    }
+    if len(s) < 3 or s.lower() in palabras_invalidas:
         return ""
         
     return s
+
+
+def extraer_productos_negativos_o_devolucion_de_texto(texto: str, es_documento_retorno: bool = False) -> list[str]:
+    """
+    Extrae candidatos de productos devueltos a partir de texto OCR o campos de texto:
+    1. Líneas con signo negativo explícito (- [Producto], -X [Producto], [Producto] -)
+    2. Líneas con cantidad o importe negativo ((-1) [Producto], [Producto] (Cantidad -1), -1x [Producto])
+    3. Líneas con palabras clave en contexto (RETURNED: [Producto], o bloques de 'Productos devueltos:')
+    4. En documentos clasificados como DEVOLUCION_RETURN (_R.jpg), líneas de producto listadas con viñetas/guiones.
+    """
+    if not texto:
+        return []
+
+    lines = [line.strip() for line in str(texto).splitlines() if line.strip()]
+    candidatos = []
+    
+    # Modo bloque: si detectamos cabecera de sección de retorno
+    en_bloque_retorno = False
+    
+    # Regex para detectar líneas con signo negativo o cantidad negativa
+    patron_negativo = re.compile(
+        r"(?:^|[\s(])[-–—]\s*(?:\$?\d+|\d+\s*(?:x|ea|pc)?|\b[A-Za-z])|"  # - Producto, -1 Producto, -$50
+        r"\(\s*-\s*\$?\d+[^)]*\)|"                                        # (-1), (-$50)
+        r"\(\s*(?:qty|cant|cantidad|retornar)?\s*[-–—]\s*\d+[^)]*\)|"   # (Cantidad -1)
+        r"\b(?:qty|cant|cantidad)\s*[:x-]?\s*-\s*\d+\b|"                 # Cantidad: -1
+        r"[-–—]\s*$",                                                    # Producto -
+        re.I
+    )
+    
+    # Regex para prefijos de retorno en la línea
+    patron_prefijo_retorno = re.compile(
+        r"^\s*(?:returned\s+items?|refunded\s+items?|return\s+items?|productos?\s+devueltos?|items?\s+retornados?|returned|refunded|return|refund|devoluci[oó]n|retorno)\s*[:–—-]\s*(.+)",
+        re.I
+    )
+    
+    # Regex para cabeceras de bloque de devolución
+    patron_cabecera_bloque = re.compile(
+        r"^(?:returned\s+items?|refunded\s+items?|return\s+items?|productos?\s+devueltos?|items?\s+retornados?|returns?|refunds?|devoluci[oó]n|retorno)\s*:\s*$",
+        re.I
+    )
+    
+    # Regex para fin de bloque de items (totales, metadata)
+    patron_fin_bloque = re.compile(
+        r"^(?:total|subtotal|sub-total|tax|balance\s*due|amount|payment|visa|mastercard|signature|date|thank\s*you)\b",
+        re.I
+    )
+
+    for line in lines:
+        # 1. Verificar si entramos en una cabecera de bloque (ej. "PRODUCTOS DEVUELTOS:", "RETURNED ITEMS:")
+        if patron_cabecera_bloque.match(line):
+            en_bloque_retorno = True
+            continue
+            
+        if en_bloque_retorno:
+            if patron_fin_bloque.match(line):
+                en_bloque_retorno = False
+            else:
+                san = sanitizar_producto_devolucion(line)
+                if san:
+                    candidatos.append(san)
+                continue
+
+        # 2. Prefijo directo de retorno en la línea (ej. RETURNED: ATOMIC HEATING MASK)
+        match_prefijo = patron_prefijo_retorno.match(line)
+        if match_prefijo:
+            prod_part = match_prefijo.group(1)
+            san = sanitizar_producto_devolucion(prod_part)
+            if san:
+                candidatos.append(san)
+            continue
+
+        # 3. Signo negativo explícito o cantidad/importe negativo (ej. - HYDRA . SILK, (-1) ACTIVING ELIXIR, etc.)
+        if patron_negativo.search(line):
+            san = sanitizar_producto_devolucion(line)
+            if san:
+                candidatos.append(san)
+            continue
+
+        # 4. En documentos clasificados como DEVOLUCION_RETURN (_R.jpg / RETURN.jpg)
+        # Si la línea tiene un bullet/viñeta o guión explícito
+        if es_documento_retorno and re.match(r"^[\s*•\-–—]\s*[A-Za-z]", line):
+            san = sanitizar_producto_devolucion(line)
+            if san:
+                candidatos.append(san)
+
+    # Deduplicar preservando orden
+    return list(dict.fromkeys(candidatos))
 
 
 def clasificar_archivo_nomenclatura(file_name: str, text: str = "", is_letter_size: bool = None) -> dict:
