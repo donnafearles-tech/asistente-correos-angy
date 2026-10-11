@@ -31,6 +31,7 @@ def sanitizar_producto_devolucion(nombre: str) -> str:
     - Cantidades negativas (-1, -2, Qty -1)
     - Precios (-$100.00, $ -50.00)
     - Códigos de producto, IDs y SKUs (ID-12345, SKU 99, ITEM #12)
+    - Palabras genéricas aisladas de totales o cabeceras
     """
     if not nombre:
         return ""
@@ -43,7 +44,7 @@ def sanitizar_producto_devolucion(nombre: str) -> str:
     s = re.sub(r"\$\s*\d+(?:\.\d+)?", "", s)
     s = re.sub(r"^[+-]\s*\d+\s*(?:x|ea|pc)?\s*", "", s, flags=re.I)
     s = re.sub(r"\b(?:qty|cant|cantidad)\s*[:x-]?\s*-?\d+\b", "", s, flags=re.I)
-    s = re.sub(r"\b(?:price|precio|total|subtotal|amount)\b[^\n]*", "", s, flags=re.I)
+    s = re.sub(r"\b(?:price|precio|total|subtotal|amount|tax|balance\s*due)\b[^\n]*", "", s, flags=re.I)
     s = re.sub(r"\b(?:ID|SKU|REF|ITEM|CODE|COD|ART)[-:\s#]*[A-Za-z0-9_-]+\b", "", s, flags=re.I)
     s = re.sub(r"\bID-\d+\b", "", s, flags=re.I)
     s = re.sub(r"#\s*\d+\b", "", s)
@@ -53,6 +54,11 @@ def sanitizar_producto_devolucion(nombre: str) -> str:
     s = re.sub(r"[:;|,]+$", "", s)
     s = re.sub(r"\([^)]*\)", "", s)
     s = re.sub(r"\s+", " ", s).strip()
+    
+    # Si lo que quedó es una palabra clave genérica o demasiado corta (< 3 caracteres), descartar
+    if len(s) < 3 or s.lower() in ["return", "refund", "returns", "refunds", "devolucion", "devolución", "void", "cancel", "cambio", "exchange"]:
+        return ""
+        
     return s
 
 
@@ -612,7 +618,8 @@ def actualizar_registro_sheets(
 ) -> dict:
     """
     Actualiza los datos de un cliente en Google Sheets (Customer Information y MASTER SHIPPINGS) para una factura específica.
-    Si el invoice no existe en MASTER SHIPPINGS, se crea automáticamente una nueva fila al final del año correspondiente.
+    - Si el invoice ya existe, se mantiene en su fila y simplemente se actualizan sus datos.
+    - Si el invoice no existe en MASTER SHIPPINGS, se crea automáticamente una nueva fila antes de la celda de la Columna A con 'DEFECTIVE DEVICES TO ARRIVE SAME DAY, IN LINE TO BE PROCESSED AT ARRIVAL'.
     Usa esta herramienta cuando el usuario pida explícitamente guardar, corregir o actualizar datos en la hoja de cálculo.
     """
     columns_ek = {}
@@ -887,16 +894,26 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
             "archivos": archivos_detectados
         })
 
-    # Si ninguno tuvo _R.jpg ni negativos, seleccionar la primera para MASTER SHIPPINGS
+    hay_devolucion = bool(invoice_devolucion_seleccionada)
+    hay_productos_sanitizables = len(productos_devueltos_sanitizados) > 0
+
     if not invoice_devolucion_seleccionada and resultados_invoices:
-        invoice_devolucion_seleccionada = resultados_invoices[0]["invoice"]
+        invoice_devolucion_seleccionada = None
 
     return {
         "relacion": "N:1 (Varios Invoices pertenecen a 1 Cliente)",
         "total_invoices_analizados": len(invoices_list),
+        "hay_devolucion": hay_devolucion,
+        "hay_productos_sanitizables": hay_productos_sanitizables,
         "invoice_seleccionado_para_master_shippings": invoice_devolucion_seleccionada,
+        "invoice_con_devolucion": invoice_devolucion_seleccionada,
+        "productos_devueltos_sanitizados": productos_devueltos_sanitizados,
         "productos_devueltos_sanitizados_para_columna_m": productos_devueltos_sanitizados,
-        "regla_aplicada": f"Solo el invoice '{invoice_devolucion_seleccionada}' se envía a MASTER SHIPPINGS con productos sanitizados sin signos aritméticos ni IDs. Los demás invoices se registran únicamente en Customer Information.",
+        "regla_aplicada": (
+            f"Solo el invoice de devolución '{invoice_devolucion_seleccionada}' se envía a MASTER SHIPPINGS con productos sanitizados "
+            f"({', '.join(productos_devueltos_sanitizados) if hay_productos_sanitizables else 'sin productos específicos sanitizables'}). "
+            f"Los demás invoices se registran únicamente en Customer Information."
+        ) if hay_devolucion else "Ninguna de las facturas presenta archivos de devolución (_R.jpg / RETURN.jpg) ni cantidades negativas.",
         "detalle_por_invoice": resultados_invoices
     }
 
