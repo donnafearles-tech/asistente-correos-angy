@@ -943,6 +943,27 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
     if not invoice_devolucion_seleccionada and resultados_invoices:
         invoice_devolucion_seleccionada = None
 
+    # Obtener todos los archivos de la carpeta ganadora para procesarlos con la misma importancia
+    archivos_carpeta_ganadora = []
+    tiene_shipping_file = False
+    tiene_vip_file = False
+    tiene_id_file = False
+
+    if invoice_devolucion_seleccionada:
+        for r in resultados_invoices:
+            if r["invoice"] == invoice_devolucion_seleccionada:
+                archivos_carpeta_ganadora = r.get("archivos", [])
+                for af in archivos_carpeta_ganadora:
+                    aname = (af.get("nombre") or "").lower()
+                    acat = af.get("categoria") or ""
+                    if acat == "shipping" or "shipping" in aname:
+                        tiene_shipping_file = True
+                    if acat == "vip" or "_v" in aname or "vip" in aname:
+                        tiene_vip_file = True
+                    if acat == "id" or "_id" in aname or "license" in aname or "passport" in aname:
+                        tiene_id_file = True
+                break
+
     return {
         "relacion": "N:1 (Varios Invoices pertenecen a 1 Cliente)",
         "total_invoices_analizados": len(invoices_list),
@@ -950,11 +971,17 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
         "hay_productos_sanitizables": hay_productos_sanitizables,
         "invoice_seleccionado_para_master_shippings": invoice_devolucion_seleccionada,
         "invoice_con_devolucion": invoice_devolucion_seleccionada,
+        "carpeta_ganadora": invoice_devolucion_seleccionada,
+        "archivos_carpeta_ganadora": archivos_carpeta_ganadora,
+        "tiene_shipping_en_carpeta_ganadora": tiene_shipping_file,
+        "tiene_vip_en_carpeta_ganadora": tiene_vip_file,
+        "tiene_id_en_carpeta_ganadora": tiene_id_file,
         "productos_devueltos_sanitizados": productos_devueltos_sanitizados,
         "productos_devueltos_sanitizados_para_columna_m": productos_devueltos_sanitizados,
         "regla_aplicada": (
             f"Solo el invoice de devolución '{invoice_devolucion_seleccionada}' se envía a MASTER SHIPPINGS con productos sanitizados "
             f"({', '.join(productos_devueltos_sanitizados) if hay_productos_sanitizables else 'sin productos específicos sanitizables'}). "
+            f"Todos los archivos de la carpeta ganadora ({len(archivos_carpeta_ganadora)} archivos) se procesan con la misma importancia (VIP, Shipping, ID y Devolución). "
             f"Los demás invoices se registran únicamente en Customer Information."
         ) if hay_devolucion else "Ninguna de las facturas presenta archivos de devolución (_R.jpg / RETURN.jpg) ni cantidades negativas.",
         "detalle_por_invoice": resultados_invoices
@@ -1072,11 +1099,16 @@ Incluye SOLO los campos que el usuario quiere modificar.
     - En situaciones donde dos, tres o más números de factura (invoices) pertenecen a la **misma persona / cliente** (relación N:1 donde "1" es el cliente):
       * **NUNCA envíes todas las facturas a MASTER SHIPPINGS**.
       * **SOLO se envía a MASTER SHIPPINGS la factura que contiene el archivo de devolución (`_R.jpg`, `R.jpg`, `RETURN.jpg`, `_r.jpg`) o productos/cantidades con signo menos `-`**.
+      * **PROCESAMIENTO EXHAUSTIVO DE LA CARPETA GANADORA**: La carpeta del invoice ganador debe incluir todos los nuevos y preexistentes archivos encontrados y procesarlos con la **misma importancia jerárquica**:
+        - **Archivos VIP (`_v.jpg`, `_V`, `VIP`)**: Fuente maestra y máxima prioridad para nombre, email y teléfono.
+        - **Archivos de Devolución (`_R.jpg`, `RETURN.jpg`, `-`)**: Extracción de productos devueltos sanitizados (sin signos +, -, $, cantidades ni SKUs/IDs).
+        - **Archivos de Envío (`Shipping.jpg`, `shipping form.jpg`)**: Validación para habilitar el guardado/envío a MASTER SHIPPINGS.
+        - **Archivos de Identificación (`_id.jpg`, `license`, `passport`) y Documentos Nuevos**: Cotejo ortográfico de nombres manuscritos, firmas, direcciones y detalles adicionales.
       * Se debe tomar **específicamente ese número de invoice con saldo negativo** para crear la fila nueva en **MASTER SHIPPINGS** (antes del banner `DEFECTIVE DEVICES...`).
       * Las facturas estándar de compra (sin devolución) se registran únicamente en **Customer Information - Shippings**.
       * **Casos límite (múltiples invoices en la carpeta)**: Si el usuario o el sistema proveen 2 números pero en la carpeta existen 3 o más, Angy y la app deben inspeccionar los archivos e identificar con precisión cuál es el número de invoice con la devolución negativa.
       * **Sanitización estricta de productos en Columna M de MASTER SHIPPINGS**: Todos los productos devueltos deben limpiarse completamente sin signos aritméticos (`-`, `+`, `(-1)`, `-$`), sin cantidades ni IDs/SKUs/códigos de barras (`ID-XXXX`, `#123`). Únicamente nombres puros y limpios del producto.
-      * Utiliza `analizar_multiples_invoices_devolucion` para inspeccionar y clasificar automáticamente el lote de facturas de un cliente.
+      * Utiliza `analizar_multiples_invoices_devolucion` para inspeccionar y clasificar automáticamente el lote de facturas de un cliente y todos los archivos de la carpeta ganadora.
 
 11. AUTODETECCIÓN TOTAL Y TRANSPARENTE DEL FRONTEND Y FIRESTORE:
     - Angy recibe y procesa AUTOMÁTICAMENTE en cada mensaje el bloque `[CONTEXTO AUTOMÁTICO EN TIEMPO REAL DEL SISTEMA / PANTALLA]`.
