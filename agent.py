@@ -170,7 +170,7 @@ def obtener_textos_de_archivos(invoice: str) -> dict:
     """
     url = f"{BACKEND_URL}/api/invoice-raw-texts?invoice={invoice}"
     try:
-        response = requests.get(url, timeout=90)
+        response = requests.get(url, timeout=180)
         if response.status_code != 200:
             return {"error": f"Error al recuperar textos. Código: {response.status_code}"}
         data = response.json()
@@ -184,6 +184,8 @@ def obtener_textos_de_archivos(invoice: str) -> dict:
             f["clasificacion_nomenclatura"] = clasif["categoria"]
             f["isPurchaseInfoShippingDoc"] = bool(f.get("isPurchaseInfoShippingDoc") or clasif["isPurchaseInfoShippingDoc"])
         return data
+    except requests.exceptions.ReadTimeout:
+        return {"error": f"El escaneo de archivos para el invoice {invoice} tomó más de 180 segundos debido al volumen o tamaño de imágenes en ShareFile. Puedes intentar llamar directamente a 'escanear_y_rellenar_master_shippings'."}
     except Exception as e:
         return {"error": f"Error de conexión con el backend: {str(e)}"}
 
@@ -202,7 +204,7 @@ def escanear_y_rellenar_master_shippings(invoice: str, guardar_en_sheets: bool =
     """
     url = f"{BACKEND_URL}/api/scan-folder-and-process"
     try:
-        response = requests.post(url, json={"invoice": str(invoice).strip(), "targetSheetType": "both"}, timeout=90)
+        response = requests.post(url, json={"invoice": str(invoice).strip(), "targetSheetType": "both"}, timeout=180)
         if response.status_code != 200:
             return {"error": f"Error al escanear carpeta en ShareFile. Código: {response.status_code}, Detalle: {response.text}"}
         scan_data = response.json()
