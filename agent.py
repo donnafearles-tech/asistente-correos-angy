@@ -29,30 +29,35 @@ def sanitizar_producto_devolucion(nombre: str) -> str:
     Sanitiza el nombre de un producto devuelto o negativo eliminando:
     - Signos aritméticos (+, -, parentesis)
     - Cantidades negativas (-1, -2, Qty -1)
-    - Precios (-$100.00, $ -50.00)
+    - Precios (-$100.00, $ -50.00, -150.00)
+    - Prefijos de nombres de archivo (ej. EMPIRETECHSSA4_233145_R.jpg - )
     - Códigos de producto, IDs y SKUs (ID-12345, SKU 99, ITEM #12)
     - Palabras genéricas aisladas de totales o cabeceras
     """
     if not nombre:
         return ""
     s = str(nombre).strip()
+    s = re.sub(r"^[A-Za-z0-9_-]+\.(?:jpe?g|png|pdf|tiff?)\s*[-–—:]*\s*", "", s, flags=re.I)
     s = re.sub(r"\(\s*-\s*\$?\s*\d+(?:\.\d+)?\s*\)", "", s)
     s = re.sub(r"\(\s*\$?\s*\d+(?:\.\d+)?\s*-\s*\)", "", s)
     s = re.sub(r"\(\s*-\s*\d+\s*\)", "", s)
     s = re.sub(r"-\s*\$\s*\d+(?:\.\d+)?", "", s)
     s = re.sub(r"\$\s*-\s*\d+(?:\.\d+)?", "", s)
     s = re.sub(r"\$\s*\d+(?:\.\d+)?", "", s)
+    s = re.sub(r"-\s*\d+(?:\.\d+)?", "", s)
+    s = re.sub(r"\b\d+\.\d{2}\b", "", s)
     s = re.sub(r"^[+-]\s*\d+\s*(?:x|ea|pc)?\s*", "", s, flags=re.I)
     s = re.sub(r"\b(?:qty|cant|cantidad)\s*[:x-]?\s*-?\d+\b", "", s, flags=re.I)
     s = re.sub(r"\b(?:price|precio|total|subtotal|amount|tax|balance\s*due)\b[^\n]*", "", s, flags=re.I)
-    s = re.sub(r"\b(?:ID|SKU|REF|ITEM|CODE|COD|ART)[-:\s#]*[A-Za-z0-9_-]+\b", "", s, flags=re.I)
-    s = re.sub(r"\bID-\d+\b", "", s, flags=re.I)
+    s = re.sub(r"\b(?:ID|SKU|REF|ITEM|CODE|COD|ART)[-:\s#]*[A-Za-z0-9_-]*\b", "", s, flags=re.I)
     s = re.sub(r"#\s*\d+\b", "", s)
     s = re.sub(r"\b\d{6,}\b", "", s)
     s = re.sub(r"^[-+*•±/\\–—\s\"'`]+", "", s)
     s = re.sub(r"[-+*•±/\\–—\s\"'`]+$", "", s)
     s = re.sub(r"[:;|,]+$", "", s)
     s = re.sub(r"\([^)]*\)", "", s)
+    s = re.sub(r"^[-+*•±/\\–—\s\"'`]+", "", s)
+    s = re.sub(r"[-+*•±/\\–—\s\"'`]+$", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     
     # Si lo que quedó es una palabra clave genérica o demasiado corta (< 3 caracteres), descartar
