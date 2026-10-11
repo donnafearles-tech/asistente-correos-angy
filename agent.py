@@ -132,6 +132,30 @@ def buscar_y_sanitizar_cliente(invoice: str) -> dict:
     except Exception as e:
         return {"error": f"Error de conexión con el backend: {str(e)}"}
 
+def consultar_productos_pendientes(invoice: str) -> dict:
+    """
+    Consulta si un cliente tiene productos o envíos pendientes por recibir.
+    Toma ÚNICA Y EXCLUSIVAMENTE la Columna M ('PRODUCTS') de la hoja de cálculo MASTER SHIPPINGS (1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY).
+    """
+    clean_inv = str(invoice or "").strip()
+    data = buscar_y_sanitizar_cliente(clean_inv)
+    if "error" in data:
+        return data
+
+    productos_columna_m = str(data.get("productos") or "").strip()
+    tiene_pendientes = bool(productos_columna_m)
+
+    return {
+        "invoice": clean_inv,
+        "cliente": f"{data.get('nombre', '')} {data.get('apellido', '')}".strip(),
+        "spreadsheet_id": "1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY",
+        "hoja_origen": "MASTER SHIPPINGS",
+        "columna": "Columna M (PRODUCTS)",
+        "tiene_productos_pendientes": tiene_pendientes,
+        "productos_pendientes": productos_columna_m if tiene_pendientes else "Ninguno (Columna M vacía)",
+        "pestaña_año": data.get("year_tab", "")
+    }
+
 def procesar_caso_zendesk(invoice: str, nombre: str, email: str, telefono: str, tienda: str, region: str) -> dict:
     """
     Registra o actualiza un caso en Zendesk para el cliente con la información proporcionada.
@@ -665,10 +689,12 @@ Incluye SOLO los campos que el usuario quiere modificar.
 
 7. Validación de correo electrónico: Utiliza `validar_correo` únicamente para un correo individual cuando el usuario lo solicite (prohibido validar en lote).
 
-8. Consulta de Productos Pendientes por Enviar:
-   - Cuando el usuario te pregunte "cuáles son los productos pendientes por enviar" (o qué productos faltan/están pendientes de envío para una factura o cliente), tu fuente directa de verdad es la columna **`PRODUCTS`** (Columna M de **MASTER SHIPPINGS**).
-   - Consulta el registro usando `buscar_y_sanitizar_cliente(invoice)` o `buscar_clientes`.
-   - Extrae el campo `productos` / columna M de MASTER SHIPPINGS y lista al usuario cada producto pendiente de forma clara, limpia y ordenada. Si la columna está vacía o no tiene productos registrados, indícale amablemente que no hay productos pendientes registrados en MASTER SHIPPINGS.
+8. REGLA ESTRICTA DE PRODUCTOS / ENVÍOS PENDIENTES (COLUMNA M DE MASTER SHIPPINGS):
+   - Cuando se te pregunte si un cliente tiene productos pendientes por recibir o si se trata de que haya un envío pendiente:
+   - Tu ÚNICA Y EXCLUSIVA fuente de verdad es la **Columna M (`PRODUCTS`)** de la hoja de cálculo **MASTER SHIPPINGS** (`1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY`).
+   - Utiliza `consultar_productos_pendientes(invoice)` o `buscar_y_sanitizar_cliente(invoice)`.
+   - Lee el campo de la Columna M (`productos`). Si contiene productos anotados, esos son los productos/envíos pendientes del cliente.
+   - Si la Columna M está vacía o no tiene productos registrados, indícale claramente al usuario que el cliente NO tiene envíos ni productos pendientes registrados en la Columna M de MASTER SHIPPINGS.
 
 9. Búsqueda y Asignación de External ID en Zendesk:
    - Cuando el usuario pregunte si un cliente existe en Zendesk (o pida buscar por correo, teléfono o nombre):
@@ -680,6 +706,7 @@ Incluye SOLO los campos que el usuario quiere modificar.
      * Responde de forma clara indicando el ID del usuario en Zendesk, su nombre, email y el estado de la asignación del `external_id`.""",
     tools=[
         buscar_y_sanitizar_cliente,
+        consultar_productos_pendientes,
         procesar_caso_zendesk,
         consultar_usuario_zendesk,
         actualizar_usuario_zendesk,
