@@ -1064,18 +1064,15 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
                             invoices_descubiertos_en_carpeta.append(f_m)
 
                 clasif = clasificar_archivo_nomenclatura(fname, ftext)
-                es_retorno = clasif.get("isReturnDocument", False) or f.get("classifiedType") == "return" or is_return_file_name(fname)
+                es_retorno = clasif.get("isReturnDocument", False) or f.get("classifiedType") == "return" or bool(REGEX_RETURN.search(fname)) or fname.lower().endswith("_r.jpg") or fname.lower().endswith("-r.jpg")
                 if es_retorno:
                     tiene_archivo_retorno = True
 
-                # FASE 1: Detección en CRUDO (Raw OCR) de líneas con signos negativos o marcas de retorno
-                if re.search(r"-\s*\$?\d+|\(\$?\d+\)|-\s*\d+\s*(?:x|ea|pc)?|(?:refund|return|devoluci[oó]n)", ftext, re.I) or es_retorno:
-                    for line in ftext.splitlines():
-                        if re.search(r"-\s*\$?\d+|\(\$?\d+\)|-\s*\d+|(?:refund|return|devoluci[oó]n)", line, re.I):
-                            # FASE 2: Sanitización posterior para la Columna M
-                            san = sanitizar_producto_devolucion(line)
-                            if san and len(san) >= 3:
-                                raw_negative_products.append(san)
+                # Detección exhaustiva de productos devueltos / negativos sobre el texto OCR completo
+                prods_extraidos = extraer_productos_negativos_o_devolucion_de_texto(ftext, es_documento_retorno=es_retorno)
+                for p_ext in prods_extraidos:
+                    if p_ext and len(p_ext) >= 3:
+                        raw_negative_products.append(p_ext)
 
                 file_info = {
                     "nombre": fname,
@@ -1086,17 +1083,59 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
                 archivos_detectados.append(file_info)
                 todos_los_archivos_carpeta.append(file_info)
 
-            # Verificar datos extraídos previamente
-            ext = scan_res.get("extractedData") or scan_res.get("extraidos") or {}
+            # Verificar datos extraídos previamente (returnProducts en extractedData / extraidos / data)
+            ext = scan_res.get("extractedData") or scan_res.get("extraidos") or scan_res.get("data") or {}
             ret_prods = ext.get("returnProducts") or ext.get("returnProductsList") or []
             if isinstance(ret_prods, list):
                 for rp in ret_prods:
-                    san = sanitizar_producto_devolucion(str(rp))
-                    if san:
-                        raw_negative_products.append(san)
+                    rp_str = str(rp).strip()
+                    prods_rp = extraer_productos_negativos_o_devolucion_de_texto(rp_str, es_documento_retorno=True)
+                    if prods_rp:
+                        raw_negative_products.extend(prods_rp)
+                    else:
+                        san = sanitizar_producto_devolucion(rp_str)
+                        if san and len(san) >= 3:
+                            raw_negative_products.append(san)
+            elif isinstance(ret_prods, str) and ret_prods.strip():
+                prods_rp = extraer_productos_negativos_o_devolucion_de_texto(ret_prods, es_documento_retorno=True)
+                if prods_rp:
+                    raw_negative_products.extend(prods_rp)
+                else:
+                    for rp_line in ret_prods.splitlines():
+                        san = sanitizar_producto_devolucion(rp_line)
+                        if san and len(san) >= 3:
+                            raw_negative_products.append(san)
+
+        # Si aún no tenemos productos y el invoice tiene archivo de retorno o es candidato, verificar Firestore
+        if tiene_archivo_retorno and not raw_negative_products:
+            try:
+                fs_data = consultar_invoice_en_firestore(inv)
+                if isinstance(fs_data, dict) and fs_data.get("success"):
+                    fs_sess = fs_data.get("session") or fs_data.get("data") or {}
+                    fs_ret = fs_sess.get("returnProducts") or fs_sess.get("returnProductsList") or []
+                    if isinstance(fs_ret, list):
+                        for rp in fs_ret:
+                            prods_rp = extraer_productos_negativos_o_devolucion_de_texto(str(rp), es_documento_retorno=True)
+                            if prods_rp:
+                                raw_negative_products.extend(prods_rp)
+                            else:
+                                san = sanitizar_producto_devolucion(str(rp))
+                                if san:
+                                    raw_negative_products.append(san)
+                    elif isinstance(fs_ret, str) and fs_ret.strip():
+                        prods_rp = extraer_productos_negativos_o_devolucion_de_texto(fs_ret, es_documento_retorno=True)
+                        if prods_rp:
+                            raw_negative_products.extend(prods_rp)
+                        else:
+                            for rp_line in fs_ret.splitlines():
+                                san = sanitizar_producto_devolucion(rp_line)
+                                if san:
+                                    raw_negative_products.append(san)
+            except Exception:
+                pass
 
         # Sanitizar y deduplicar productos de retorno
-        prods_sanitizados = list(dict.fromkeys([p for p in raw_negative_products if p]))
+        prods_sanitizados = list(dict.fromkeys([p for p in raw_negative_products if p and len(p) >= 3]))
 
         es_candidato_master = tiene_archivo_retorno or len(prods_sanitizados) > 0
         if es_candidato_master and not invoice_devolucion_seleccionada:
