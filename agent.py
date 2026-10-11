@@ -127,32 +127,82 @@ def buscar_y_sanitizar_cliente(invoice: str) -> dict:
             "email_sanitizado": display_email,
             "email_estado": email_status,
             "shipping": record.get("shipping") or "",
-            "notas": record.get("csComment") or ""
+            "notas": record.get("csComment") or "",
+            # Distinción de Hojas y Datos de MASTER SHIPPINGS
+            "found_in_master": record.get("foundInMaster", False),
+            "master_shippings_products": record.get("masterProducts") or "",
+            "master_shippings_notes": record.get("masterNotes") or "",
+            "is_shipping_no": record.get("isShippingNo", False),
+            "has_pending_products": record.get("hasPendingProducts", False),
+            "pending_reason": record.get("pendingReason") or ""
         }
     except Exception as e:
         return {"error": f"Error de conexión con el backend: {str(e)}"}
 
 def consultar_productos_pendientes(invoice: str) -> dict:
     """
-    Consulta si un cliente tiene productos o envíos pendientes por recibir.
-    Toma ÚNICA Y EXCLUSIVAMENTE la Columna M ('PRODUCTS') de la hoja de cálculo MASTER SHIPPINGS (1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY).
+    Consulta si un cliente tiene productos o envíos pendientes por recibir, evaluando conjuntamente las 2 hojas:
+    1. Hoja 1 - Customer Information - Shippings (1-D0F025w23P9daLlLsfcGAbi9o_pnM1A_p70WtlZdK4):
+       - Columna M ('SHIPPING'): Si tiene un 'NO', por consecuencia lógica la respuesta a si tiene productos pendientes es 'NO'.
+    2. Hoja 2 - MASTER SHIPPINGS (1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY):
+       - Columna M ('PRODUCTS'): Revisa rápidamente casos límite donde un humano agregó manualmente productos por enviar debido a compensaciones, regalos o devoluciones.
     """
     clean_inv = str(invoice or "").strip()
     data = buscar_y_sanitizar_cliente(clean_inv)
     if "error" in data:
         return data
 
-    productos_columna_m = str(data.get("productos") or "").strip()
-    tiene_pendientes = bool(productos_columna_m)
+    shipping_col_m_cust = str(data.get("shipping") or "").strip()
+    is_shipping_no = shipping_col_m_cust.upper() in ["NO", "N"]
+    
+    master_prod = str(data.get("master_shippings_products") or "").strip()
+    has_human_addition = bool(master_prod)
+
+    # REGLA LÓGICA ESTRICTA:
+    # Si Columna M de Customer Information es "NO" -> Por consecuencia lógica la respuesta es "NO",
+    # salvo caso límite donde un humano haya agregado en MASTER SHIPPINGS una compensación o regalo.
+    if is_shipping_no:
+        if has_human_addition:
+            tiene_pendientes = True
+            estado = f"SÍ (Caso límite detectado: Aunque la Columna M de Customer Information es 'NO', un humano agregó productos por enviar en MASTER SHIPPINGS por compensación/regalo: {master_prod})"
+            detalles = master_prod
+        else:
+            tiene_pendientes = False
+            estado = "NO (La Columna M 'SHIPPING' en Customer Information es 'NO' y no hay compensaciones ni regalos en MASTER SHIPPINGS)"
+            detalles = "Ninguno"
+    else:
+        # Si no es "NO" (ej. "YES", "SI" o tiene envío registrado)
+        if has_human_addition:
+            tiene_pendientes = True
+            estado = f"SÍ (Productos registrados en MASTER SHIPPINGS: {master_prod})"
+            detalles = master_prod
+        elif data.get("productos"):
+            tiene_pendientes = True
+            estado = f"SÍ (Envío solicitado con productos: {data.get('productos')})"
+            detalles = str(data.get("productos"))
+        else:
+            tiene_pendientes = bool(shipping_col_m_cust)
+            estado = "SÍ (Envío registrado)" if tiene_pendientes else "NO (Sin productos pendientes)"
+            detalles = shipping_col_m_cust or "Ninguno"
 
     return {
         "invoice": clean_inv,
         "cliente": f"{data.get('nombre', '')} {data.get('apellido', '')}".strip(),
-        "spreadsheet_id": "1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY",
-        "hoja_origen": "MASTER SHIPPINGS",
-        "columna": "Columna M (PRODUCTS)",
         "tiene_productos_pendientes": tiene_pendientes,
-        "productos_pendientes": productos_columna_m if tiene_pendientes else "Ninguno (Columna M vacía)",
+        "respuesta_resumen": "SI" if tiene_pendientes else "NO",
+        "estado_detallado": estado,
+        "productos_pendientes": detalles,
+        "hoja_customer_info": {
+            "id": "1-D0F025w23P9daLlLsfcGAbi9o_pnM1A_p70WtlZdK4",
+            "nombre": "Customer Information - Shippings",
+            "columna_m_shipping": shipping_col_m_cust or "No especificado"
+        },
+        "hoja_master_shippings": {
+            "id": "1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY",
+            "nombre": "MASTER SHIPPINGS",
+            "columna_m_products": master_prod or "Vacía",
+            "encontrado_en_master": data.get("found_in_master", False)
+        },
         "pestaña_año": data.get("year_tab", "")
     }
 
@@ -691,12 +741,20 @@ Incluye SOLO los campos que el usuario quiere modificar.
 
 7. Validación de correo electrónico: Utiliza `validar_correo` únicamente para un correo individual cuando el usuario lo solicite (prohibido validar en lote).
 
-8. REGLA ESTRICTA DE PRODUCTOS / ENVÍOS PENDIENTES (COLUMNA M DE MASTER SHIPPINGS):
-   - Cuando se te pregunte si un cliente tiene productos pendientes por recibir o si se trata de que haya un envío pendiente:
-   - Tu ÚNICA Y EXCLUSIVA fuente de verdad es la **Columna M (`PRODUCTS`)** de la hoja de cálculo **MASTER SHIPPINGS** (`1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY`).
-   - Utiliza `consultar_productos_pendientes(invoice)` o `buscar_y_sanitizar_cliente(invoice)`.
-   - Lee el campo de la Columna M (`productos`). Si contiene productos anotados, esos son los productos/envíos pendientes del cliente.
-   - Si la Columna M está vacía o no tiene productos registrados, indícale claramente al usuario que el cliente NO tiene envíos ni productos pendientes registrados en la Columna M de MASTER SHIPPINGS.
+8. DISTINCIÓN DE HOJAS DE CÁLCULO Y REGLA LÓGICA DE PRODUCTOS PENDIENTES:
+   - Existen dos hojas de cálculo independientes que NUNCA debes confundir:
+     * **Hoja 1**: `Customer Information - Shippings` (ID: `1-D0F025w23P9daLlLsfcGAbi9o_pnM1A_p70WtlZdK4`).
+       -> Su **Columna M** es **`SHIPPING`** (indica si la venta requirió envío: "NO", "YES", "SI").
+     * **Hoja 2**: `MASTER SHIPPINGS` (ID: `1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY`).
+       -> Su **Columna M** es **`PRODUCTS`** (registra productos a despachar, devoluciones, o compensaciones/regalos agregados por un humano).
+   - REGLA LÓGICA DE RESPUESTA A PRODUCTOS PENDIENTES:
+     * Si en la **Columna M (`SHIPPING`)** de **Customer Information - Shippings** (`1-D0F025w23P9daLlLsfcGAbi9o_pnM1A_p70WtlZdK4`) tenemos un **"NO"**:
+       -> Por consecuencia lógica, la respuesta a si el cliente tiene productos pendientes por recibir será **"NO"** (el cliente se llevó su compra en tienda o no requirió envío).
+     * **CASOS LÍMITE / REVISIÓN RÁPIDA DE EXCEPCIONES**:
+       -> Revisa rápidamente en **MASTER SHIPPINGS** (`1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY`) en la **Columna M (`PRODUCTS`)** o notas si un operador humano agregó algún producto por enviar debido a una **compensación**, **regalo** o reemplazo.
+       -> Si un humano agregó un regalo o compensación en MASTER SHIPPINGS: Responde que como caso límite existe ese regalo/compensación registrado para envío.
+       -> Si MASTER SHIPPINGS está vacío o no tiene productos agregados: La respuesta es definitivamente **"NO"** (sin productos pendientes).
+     * Utiliza la herramienta `consultar_productos_pendientes(invoice)` para obtener automáticamente esta evaluación combinada.
 
 9. Búsqueda y Asignación de External ID en Zendesk:
    - Cuando el usuario pregunte si un cliente existe en Zendesk (o pida buscar por correo, teléfono o nombre):
