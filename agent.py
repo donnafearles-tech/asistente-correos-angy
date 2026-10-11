@@ -685,7 +685,9 @@ Sigue estrictamente estas reglas al responder preguntas, procesar archivos o uti
 FIELD_UPDATE:{"name":"valor","lastName":"valor","telephone":"valor","email":"valor","address":"valor","city":"valor","state":"valor","zipCode":"valor","country":"valor","saleDate":"valor","salesRep":"valor","storeName":"valor","products":"valor"}
 Incluye SOLO los campos que el usuario quiere modificar.
 
-6. Guardado en Google Sheets (MASTER SHIPPINGS / Customer Information): Si el usuario solicita guardar o aplicar cambios en Google Sheets, utiliza `actualizar_registro_sheets` o `escanear_y_rellenar_master_shippings(invoice, guardar_en_sheets=True)`.
+6. Guardado en Google Sheets (MASTER SHIPPINGS / Customer Information):
+   - REGLA OBLIGATORIA DE MASTER SHIPPINGS: Solo se envían o guardan registros a **MASTER SHIPPINGS** (`1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY`) **SI Y SOLO SI** entre los archivos del invoice existe el archivo nombrado **`"Shipping.jpg"`** o **`"shipping form.jpg"`**. Si no cuenta con dicho archivo, el guardado en MASTER SHIPPINGS queda ESTRICTAMENTE BLOQUEADO.
+   - Si el usuario solicita guardar o aplicar cambios en Google Sheets, utiliza `actualizar_registro_sheets` o `escanear_y_rellenar_master_shippings(invoice, guardar_en_sheets=True)`.
 
 7. Validación de correo electrónico: Utiliza `validar_correo` únicamente para un correo individual cuando el usuario lo solicite (prohibido validar en lote).
 
