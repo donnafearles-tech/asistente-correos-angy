@@ -8,25 +8,71 @@ from google.adk.agents.llm_agent import Agent
 IS_CLOUD_RUN = os.environ.get("K_SERVICE") is not None
 DEFAULT_BACKEND = "https://customer-information-720693669884.us-central1.run.app" if IS_CLOUD_RUN else "http://localhost:3000"
 BACKEND_URL = os.environ.get("BACKEND_URL", DEFAULT_BACKEND)
+SELLER_ASSISTANT_URL = os.environ.get("SELLER_ASSISTANT_URL", "https://seller-assitant-720693669884.europe-west1.run.app")
 
 # Lista negra de teléfonos de empresa corporativos
 COMPANY_PHONES = {"8882494189", "18882494189"}
 
+import re
+
+REGEX_VIP = re.compile(r"(?:^|[\s_-])(?:v|vip)(?:[\s_.-]|$)", re.IGNORECASE)
+REGEX_SHIPPING = re.compile(r"shippin(?:g)?(?:\s*form)?", re.IGNORECASE)
+REGEX_PURCHASE_INFO = re.compile(r"purchase\s+inf[o0]rmati[o0]n", re.IGNORECASE)
+REGEX_TICKET_NOVA = re.compile(r"(?:_(?:n|nov)\b|[\s_-]n\.jpe?g$|\bnova\b|\binvoice[\s_-]*\d{4,6}\.jpe?g$)", re.IGNORECASE)
+REGEX_ID = re.compile(r"(?:^|[\s_-])(?:id|pass|passport|pp|dl|license)(?:[\s_.-]|$)", re.IGNORECASE)
+REGEX_EXCLUDED = re.compile(r"(?:gbk|5cc|50c|ccid|(?<![a-z])cid(?![a-z]))", re.IGNORECASE)
+
+
+def clasificar_archivo_nomenclatura(file_name: str, text: str = "", is_letter_size: bool = None) -> dict:
+    """
+    Clasifica un archivo según las reglas Regex oficiales de Shipping Autofill y la regla
+    imbricada de Tamaño Carta + 'Purchase information'.
+    """
+    fname = str(file_name or "").strip()
+    raw_text = str(text or "")
+    has_purchase_info = bool(REGEX_PURCHASE_INFO.search(raw_text))
+    letter_ok = True if is_letter_size is None else bool(is_letter_size)
+    is_purchase_info_shipping_doc = has_purchase_info and letter_ok
+
+    if REGEX_EXCLUDED.search(fname):
+        categoria = "EXCLUIDO_EMPRESA_DEUDOR (GBK/5CC/50C/CID)"
+    elif REGEX_VIP.search(fname) or "vip" in fname.lower():
+        categoria = "VIP_FORM (_V / VIP)"
+    elif REGEX_SHIPPING.search(fname):
+        categoria = "SHIPPING_FORM (Nombre estándar)"
+    elif is_purchase_info_shipping_doc:
+        categoria = "SHIPPING_FORM_POR_CONTENIDO (Tamaño Carta + 'Purchase information')"
+    elif REGEX_TICKET_NOVA.search(fname):
+        categoria = "TICKET_COMPRA_NOVA (_N / _NOV / NOVA / INVOICE)"
+    elif REGEX_ID.search(fname):
+        categoria = "DOCUMENTO_IDENTIDAD (_ID / PASS / PP)"
+    else:
+        categoria = "OTRO_DOCUMENTO"
+
+    return {
+        "categoria": categoria,
+        "isLetterSize": is_letter_size,
+        "hasPurchaseInformation": has_purchase_info,
+        "isPurchaseInfoShippingDoc": is_purchase_info_shipping_doc,
+    }
+
+
 def buscar_y_sanitizar_cliente(invoice: str) -> dict:
     """
-    Busca los datos de un cliente en la base de datos por su número de invoice,
-    limpia y sanitiza la información distinguiendo datos de empresa de datos de cliente,
+    Busca los datos de un cliente en Google Sheets (tanto en Customer Information como en MASTER SHIPPINGS
+    en todas las pestañas 2023, 2024, 2025, 2026) por su número de invoice, limpia y sanitiza la información
     y bloquea estrictamente los teléfonos y correos corporativos (ej. 8882494189).
     """
-    url = f"{BACKEND_URL}/api/sheets/record-by-invoice?invoice={invoice}"
+    clean_inv = str(invoice or "").strip()
+    url = f"{BACKEND_URL}/api/sheets/record-by-invoice?invoice={clean_inv}"
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=15)
         if response.status_code != 200:
             return {"error": f"No se pudo consultar el backend. Código: {response.status_code}"}
         
         data = response.json()
         if not data.get("success") or not data.get("record"):
-            return {"error": f"No se encontró registro para la factura {invoice}"}
+            return {"error": f"No se encontró registro en Google Sheets para la factura {clean_inv}. Puedes usar 'escanear_y_rellenar_master_shippings' o 'obtener_textos_de_archivos' para buscarla directamente en ShareFile."}
         
         record = data["record"]
         
@@ -61,18 +107,27 @@ def buscar_y_sanitizar_cliente(invoice: str) -> dict:
             display_email = raw_email
 
         return {
-            "invoice": invoice,
+            "invoice": record.get("invoice") or clean_inv,
+            "year_tab": record.get("year") or "",
             "nombre": record.get("name") or "",
             "apellido": record.get("lastName") or "",
             "tienda": record.get("storeName") or "",
-            "region": record.get("region") or "",
+            "fecha_venta": record.get("fecha") or "",
+            "vendedor_sales_rep": record.get("salesRep") or "",
+            "direccion_address_1": record.get("address") or "",
+            "ciudad_city": record.get("city") or "",
+            "region_state": record.get("region") or "",
+            "codigo_postal_zip": record.get("zipCode") or "",
+            "pais_country": record.get("country") or "",
+            "productos": record.get("products") or "",
             "telefono_original": raw_phone,
             "telefono_sanitizado": display_phone,
             "telefono_estado": phone_status,
             "email_original": raw_email,
             "email_sanitizado": display_email,
             "email_estado": email_status,
-            "shipping": record.get("shipping") or ""
+            "shipping": record.get("shipping") or "",
+            "notas": record.get("csComment") or ""
         }
     except Exception as e:
         return {"error": f"Error de conexión con el backend: {str(e)}"}
@@ -108,18 +163,84 @@ def procesar_caso_zendesk(invoice: str, nombre: str, email: str, telefono: str, 
 
 def obtener_textos_de_archivos(invoice: str) -> dict:
     """
-    Busca todos los archivos (VIP, Shipping, ID, etc.) relacionados con el invoice en ShareFile,
-    realiza el escaneo OCR y devuelve el nombre del archivo y el texto completo (transcripción) de cada uno.
-    Utilízalo para analizar el contenido real de los archivos del cliente de manera inteligente.
+    Busca todos los archivos (VIP, Shipping, Tamaño Carta con 'Purchase information', Ticket _N, ID, etc.)
+    relacionados con el invoice en ShareFile (usando autorización perpetua vía seller-assitant / OAuth2 refresh_token),
+    ejecuta los 3 momentos de escaneo (1. Descarga + Dimensiones, 2. Inferencia OCR + Detección 'Purchase information',
+    3. Escritura en Firestore) y devuelve la clasificación Regex, dimensiones, campos extraídos y transcripción completa.
     """
     url = f"{BACKEND_URL}/api/invoice-raw-texts?invoice={invoice}"
     try:
-        response = requests.get(url, timeout=90)  # El OCR de múltiples archivos puede tardar un poco
+        response = requests.get(url, timeout=90)
         if response.status_code != 200:
             return {"error": f"Error al recuperar textos. Código: {response.status_code}"}
-        return response.json()
+        data = response.json()
+        files = data.get("files") or []
+        for f in files:
+            clasif = clasificar_archivo_nomenclatura(
+                f.get("fileName", ""),
+                f.get("text", ""),
+                f.get("isLetterSize")
+            )
+            f["clasificacion_nomenclatura"] = clasif["categoria"]
+            f["isPurchaseInfoShippingDoc"] = bool(f.get("isPurchaseInfoShippingDoc") or clasif["isPurchaseInfoShippingDoc"])
+        return data
     except Exception as e:
         return {"error": f"Error de conexión con el backend: {str(e)}"}
+
+
+def escanear_y_rellenar_master_shippings(invoice: str, guardar_en_sheets: bool = False) -> dict:
+    """
+    Escanea de forma imbricada la carpeta de ShareFile del invoice pasando por los 3 momentos:
+    1. MEDICIÓN DE DESCARGA DE IMAGEN (y verificación de proporción Tamaño Carta 8.5x11)
+    2. MEDICIÓN DE INFERENCIA DE IA (Vertex/Gemini OCR + detección de la frase 'Purchase information' cuando un humano renombró mal el archivo shipping.jpg)
+    3. MEDICIÓN DE ESCRITURA EN DB (Firestore)
+    Extrae con prioridad:
+    - 'Address 1 (Street)', 'City', 'Sales rep' y 'Country' desde el archivo Shipping o el archivo Tamaño Carta que contenga 'Purchase information'.
+    - REGLA DE PAÍS: El 'Country' extraído explícitamente de este documento tiene PRIORIDAD ABSOLUTA sobre la deducción por número de teléfono.
+    Si guardar_en_sheets=True, escribe además los datos en MASTER SHIPPINGS y Customer Information.
+    """
+    url = f"{BACKEND_URL}/api/scan-folder-and-process"
+    try:
+        response = requests.post(url, json={"invoice": str(invoice).strip()}, timeout=90)
+        if response.status_code != 200:
+            return {"error": f"Error al escanear carpeta en ShareFile. Código: {response.status_code}, Detalle: {response.text}"}
+        scan_data = response.json()
+        if not scan_data.get("success"):
+            return scan_data
+
+        extracted = scan_data.get("data") or {}
+        sheet_update_result = None
+        if guardar_en_sheets and extracted:
+            upd_res = actualizar_registro_sheets(
+                invoice=str(invoice).strip(),
+                nombre=extracted.get("name"),
+                apellido=extracted.get("lastName"),
+                telefono=extracted.get("phone"),
+                email=extracted.get("email"),
+                direccion=extracted.get("address"),
+                ciudad=extracted.get("city"),
+                region=extracted.get("state"),
+                zipCode=extracted.get("zipCode"),
+                pais=extracted.get("country"),
+                fecha_venta=extracted.get("saleDate"),
+                vendedor=extracted.get("salesRep"),
+                tienda=extracted.get("storeName"),
+                productos=extracted.get("products"),
+            )
+            sheet_update_result = upd_res
+
+        return {
+            "success": True,
+            "invoice": invoice,
+            "sharefile_auth_mode": "perpetual_oauth2_and_seller_assistant",
+            "seller_assistant_url": SELLER_ASSISTANT_URL,
+            "datos_extraidos_para_master_shippings": extracted,
+            "archivos_procesados": scan_data.get("filesProcessed", []),
+            "guardado_en_sheets": sheet_update_result,
+        }
+    except Exception as e:
+        return {"error": f"Error en escanear_y_rellenar_master_shippings: {str(e)}"}
+
 
 def actualizar_registro_sheets(
     invoice: str,
@@ -127,27 +248,21 @@ def actualizar_registro_sheets(
     apellido: str = None,
     telefono: str = None,
     email: str = None,
+    direccion: str = None,
+    ciudad: str = None,
     region: str = None,
     zipCode: str = None,
+    pais: str = None,
+    fecha_venta: str = None,
+    vendedor: str = None,
+    tienda: str = None,
     productos: str = None,
     shipping: str = None,
     comentario: str = None
 ) -> dict:
     """
-    Actualiza los datos de un cliente en Google Sheets para una factura específica.
+    Actualiza los datos de un cliente en Google Sheets (Customer Information y MASTER SHIPPINGS) para una factura específica.
     Usa esta herramienta cuando el usuario pida explícitamente guardar, corregir o actualizar datos en la hoja de cálculo.
-    
-    Args:
-        invoice: El número de factura del cliente (ej: 'MM-12345' o '12345').
-        nombre: El primer nombre del cliente (ej: 'John').
-        apellido: El apellido del cliente (ej: 'Doe').
-        telefono: El número de teléfono de contacto (ej: '3051234567'). No se permiten números corporativos.
-        email: El correo electrónico del cliente (ej: 'john.doe@gmail.com'). No se permiten correos corporativos.
-        region: El estado, región o ciudad del cliente (ej: 'FL' o 'Miami').
-        zipCode: El código postal de 5 dígitos (ej: '33101').
-        productos: La lista de productos comprados (ej: 'C.TOX Moisturizer').
-        shipping: Estado de envío del cliente ('SI' o 'NO').
-        comentario: Comentario opcional que se guardará en la columna de notas (columna NOTES).
     """
     columns_ek = {}
     if nombre is not None: columns_ek["E"] = str(nombre).strip()
@@ -181,17 +296,27 @@ def actualizar_registro_sheets(
             clean_shipping = "NO"
         columns_ek["M"] = clean_shipping
 
+    extraction_data = {
+        "columnsEK": columns_ek
+    }
+    if direccion is not None: extraction_data["address"] = str(direccion).strip()
+    if ciudad is not None: extraction_data["city"] = str(ciudad).strip()
+    if region is not None: extraction_data["state"] = str(region).strip()
+    if zipCode is not None: extraction_data["zipCode"] = str(zipCode).strip()
+    if pais is not None: extraction_data["country"] = str(pais).strip()
+    if fecha_venta is not None: extraction_data["saleDate"] = str(fecha_venta).strip()
+    if vendedor is not None: extraction_data["salesRep"] = str(vendedor).strip()
+    if tienda is not None: extraction_data["storeName"] = str(tienda).strip()
+
     payload = {
         "invoice": invoice,
         "comment": comentario,
-        "extractionData": {
-            "columnsEK": columns_ek
-        }
+        "extractionData": extraction_data
     }
     
     url = f"{BACKEND_URL}/api/sheets/update"
     try:
-        response = requests.post(url, json=payload, timeout=15)
+        response = requests.post(url, json=payload, timeout=20)
         if response.status_code == 200:
             return response.json()
         return {"error": f"Error al actualizar Sheets. Código: {response.status_code}, Detalle: {response.text}"}
@@ -200,18 +325,35 @@ def actualizar_registro_sheets(
 
 def buscar_clientes(filtro: str = None, campo: str = None, valor: str = None) -> dict:
     """
-    Busca y filtra clientes en Google Sheets que cumplan con ciertas condiciones o características.
-    Usa esta herramienta cuando el usuario pregunte por listas de clientes de una tienda, región,
-    con disputas/notas o que compraron un producto específico.
-    
-    Args:
-        filtro: Búsqueda de texto libre general que coincida con cualquier campo del registro (nombre, productos, notas, etc.).
-        campo: Filtrar por un campo específico ('invoice', 'nombre', 'tienda', 'region', 'email', 'telefono', 'productos', 'notas', 'shipping').
-        valor: El valor exacto o parcial a buscar dentro del campo especificado.
+    Busca y filtra clientes en Google Sheets (incluyendo MASTER SHIPPINGS y Customer Information en pestañas 2023-2026).
+    Soporta búsqueda directa por número de invoice o texto libre sin desbordar el límite de memoria de Cloud Run.
     """
+    search_campo = str(campo).strip().lower() if campo else None
+    search_valor = str(valor).strip() if valor else None
+    search_filtro = str(filtro).strip() if filtro else None
+
+    # Si busca por invoice específico o un número de factura, consultar también record-by-invoice directamente
+    candidate_invoice = None
+    if search_campo == "invoice" and search_valor:
+        candidate_invoice = search_valor
+    elif search_filtro and re.match(r"^(?:inv[o0]ice[\s_#-]*|mm[\s_-]*)?\d{3,8}$", search_filtro, re.IGNORECASE):
+        candidate_invoice = re.sub(r"^(?:inv[o0]ice[\s_#-]*|mm[\s_-]*)", "", search_filtro, flags=re.IGNORECASE).strip()
+    elif search_valor and re.match(r"^(?:inv[o0]ice[\s_#-]*|mm[\s_-]*)?\d{3,8}$", search_valor, re.IGNORECASE):
+        candidate_invoice = re.sub(r"^(?:inv[o0]ice[\s_#-]*|mm[\s_-]*)", "", search_valor, flags=re.IGNORECASE).strip()
+
+    if candidate_invoice:
+        direct = buscar_y_sanitizar_cliente(candidate_invoice)
+        if "error" not in direct:
+            return {"total_coincidencias": 1, "resultados": [direct]}
+
+    query_term = search_valor or search_filtro or ""
+    params = {"limit": "300"}
+    if query_term:
+        params["search"] = query_term
+
     url = f"{BACKEND_URL}/api/sheets"
     try:
-        response = requests.get(url, timeout=20)
+        response = requests.get(url, params=params, timeout=25)
         if response.status_code != 200:
             return {"error": f"No se pudo consultar la lista de clientes. Código: {response.status_code}"}
         
@@ -222,12 +364,15 @@ def buscar_clientes(filtro: str = None, campo: str = None, valor: str = None) ->
         records = data["data"]
         resultados = []
         
-        # Mapeo de campos a llaves de la respuesta del backend
         key_mapping = {
             "invoice": "invoice",
             "nombre": "customerName",
             "tienda": "storeName",
             "region": "region",
+            "ciudad": "city",
+            "direccion": "address",
+            "pais": "country",
+            "vendedor": "salesRep",
             "email": "email",
             "telefono": "phone",
             "productos": "products",
@@ -235,42 +380,47 @@ def buscar_clientes(filtro: str = None, campo: str = None, valor: str = None) ->
             "shipping": "shipping"
         }
         
-        # Normalizar filtros
-        search_campo = str(campo).strip().lower() if campo else None
-        search_valor = str(valor).strip().lower() if valor else None
-        search_filtro = str(filtro).strip().lower() if filtro else None
+        search_valor_lower = search_valor.lower() if search_valor else None
+        search_filtro_lower = search_filtro.lower() if search_filtro else None
         
         for r in records:
             match = True
-            
-            # 1. Filtro exacto por campo/valor
-            if search_campo and search_valor:
+            if search_campo and search_valor_lower:
                 target_key = key_mapping.get(search_campo, search_campo)
                 field_val = str(r.get(target_key) or "").lower()
-                if search_valor not in field_val:
+                if search_valor_lower not in field_val:
                     match = False
                     
-            # 2. Filtro de búsqueda libre
-            if match and search_filtro:
+            if match and search_filtro_lower:
                 combined_text = " ".join([
-                    r.get("invoice") or "",
-                    r.get("customerName") or "",
-                    r.get("storeName") or "",
-                    r.get("region") or "",
-                    r.get("email") or "",
-                    r.get("phone") or "",
-                    r.get("products") or "",
-                    r.get("csComment") or ""
+                    str(r.get("invoice") or ""),
+                    str(r.get("customerName") or ""),
+                    str(r.get("storeName") or ""),
+                    str(r.get("address") or ""),
+                    str(r.get("city") or ""),
+                    str(r.get("region") or ""),
+                    str(r.get("country") or ""),
+                    str(r.get("salesRep") or ""),
+                    str(r.get("email") or ""),
+                    str(r.get("phone") or ""),
+                    str(r.get("products") or ""),
+                    str(r.get("csComment") or "")
                 ]).lower()
-                if search_filtro not in combined_text:
+                if search_filtro_lower not in combined_text:
                     match = False
                     
             if match:
                 resultados.append({
                     "invoice": r.get("invoice") or "",
+                    "year": r.get("year") or "",
                     "nombre": r.get("customerName") or "",
                     "tienda": r.get("storeName") or "",
+                    "fecha_venta": r.get("fecha") or "",
+                    "vendedor": r.get("salesRep") or "",
+                    "direccion": r.get("address") or "",
+                    "ciudad": r.get("city") or "",
                     "region": r.get("region") or "",
+                    "pais": r.get("country") or "",
                     "email": r.get("email") or "",
                     "telefono": r.get("phone") or "",
                     "productos": r.get("products") or "",
@@ -302,25 +452,49 @@ def validar_correo(email: str) -> dict:
         return {"error": f"Error de conexión al validar correo: {str(e)}"}
 
 root_agent = Agent(
-    model='gemini-3.6-flash',
+    model='gemini-2.5-flash',
     name='root_agent',
-    description='Asistente experto para Shipping Autofill y redacción de correos.',
-    instruction="""Eres un asistente experto para el sistema Shipping Autofill.
+    description='Asistente experto Angy para Shipping Autofill, MASTER SHIPPINGS y redacción de correos.',
+    instruction="""Eres Angy, el agente experto e imbricado en el pipeline de Shipping Autofill y MASTER SHIPPINGS.
+Hablas el mismo idioma técnico que la aplicación y dominas las reglas de nomenclatura Regex, los 3 momentos de telemetría de escaneo y la autorización perpetua con ShareFile.
+
 Sigue estrictamente estas reglas al responder preguntas, procesar archivos o utilizar tus herramientas:
 
-1. Bloqueo de Teléfono Corporativo: El número '8882494189' (y '18882494189') es el teléfono de la propia empresa. Está ESTRICTAMENTE PROHIBIDO utilizarlo como dato de contacto del cliente. Si la herramienta 'buscar_y_sanitizar_cliente' te lo devuelve bloqueado o vacío, nunca intentes deducirlo o usarlo.
-2. Prioridad de Documentos: Para extraer el nombre, apellido, correo o teléfono del cliente, prioriza siempre los archivos con 'VIP' o '_V' en el nombre. Si no existen, usa archivos con 'shippin' o 'shipping'. Si tampoco existen, usa archivos con 'PASS', 'ID' o 'PP'.
-3. Extracción de Email: Pon especial atención en extraer con precisión el correo electrónico del cliente desde los archivos VIP, ya que son la fuente primaria de verdad.
-4. Exclusiones de Archivos: Ignora por completo cualquier archivo que contenga 'gbk' o '5cc' en el nombre, ya que representan material promocional de la empresa o copias de tarjetas bancarias, no datos de contacto del cliente.
-5. Análisis inteligente de archivos: Si el usuario te pide analizar o extraer información de los archivos de una factura, usa la herramienta 'obtener_textos_de_archivos' para obtener sus transcripciones. Luego, analiza detalladamente el texto de todos los archivos juntos, distinguiendo la información del cliente del texto de la empresa, y descarta cualquier número de teléfono o correo corporativo (ej. 8882494189) antes de responder.
-6. Actualización de campos del formulario: Si el usuario te pide corregir, cambiar o actualizar un dato del cliente en el formulario (nombre, apellido, teléfono, email, ciudad, estado, código postal o productos), incluye en tu respuesta un bloque JSON con el siguiente formato EXACTO (sin backticks ni markdown):
-FIELD_UPDATE:{"name":"valor","lastName":"valor","telephone":"valor","email":"valor","city":"valor","state":"valor","zipCode":"valor","products":"valor"}
-Incluye SOLO los campos que el usuario quiere modificar. Por ejemplo, si solo quiere cambiar el email:
-FIELD_UPDATE:{"email":"nuevo@correo.com"}
-Si el usuario dice algo como "el correo es maria@gmail.com", "cambia el nombre a Juan", "el teléfono correcto es 3051234567", o "agrega producto X", responde confirmando el cambio Y emite el bloque FIELD_UPDATE correspondiente.
-7. Consulta y búsqueda de clientes: Si el usuario te pregunta por listas de clientes que cumplan con ciertas condiciones (por ejemplo, clientes de una tienda, una región, compras de un producto específico, o notas como disputas), utiliza la herramienta 'buscar_clientes' para obtener los registros y respóndele de forma resumida y profesional.
-8. Guardado y actualización en Google Sheets: Si el usuario te solicita guardar, registrar o aplicar cambios en la hoja de cálculo o Google Sheets (por ejemplo: "guarda los cambios en sheets", "registra el teléfono en sheets"), utiliza la herramienta 'actualizar_registro_sheets' para aplicar los cambios directamente en la base de datos.
-9. Validación de correo electrónico: Si el usuario te pide validar, verificar o comprobar si una dirección de correo electrónico es real, válida o entregable (o si necesitas validar un correo recuperado), utiliza la herramienta 'validar_correo'. Está COMPLETAMENTE PROHIBIDO realizar validaciones masivas, en lote o en bucle para múltiples correos. Si el usuario te pide encontrar, revisar o validar múltiples correos, lístalos de forma resumida y explícale amablemente que por seguridad y políticas de consumo de créditos de la API (Debounce), debe indicarte cuál específico desea validar de forma individual.""",
-    tools=[buscar_y_sanitizar_cliente, procesar_caso_zendesk, obtener_textos_de_archivos, actualizar_registro_sheets, buscar_clientes, validar_correo],
+1. LOS 3 MOMENTOS DEL PIPELINE DE ESCANEO (Imbricación de Angy):
+   - Momento 1 (`// 1. MEDICIÓN DE DESCARGA DE IMAGEN`): Se descarga la imagen desde ShareFile usando autorización perpetua OAuth2 / `https://seller-assitant-720693669884.europe-west1.run.app` y se inspecciona su cabecera binaria para detectar si el documento es **Tamaño Carta (`isLetterSize: true`, proporción ~0.77 / 8.5x11)**.
+   - Momento 2 (`// 2. MEDICIÓN DE INFERENCIA DE IA (Vertex/Gemini OCR)`): Se extrae el texto y los campos estructurados. Si un humano renombró mal el archivo (no se llama `shipping.jpg` ni `shipping form.jpg`), pero el archivo es **Tamaño Carta** y contiene la frase **`"Purchase information"`** dentro del texto escaneado, se clasifica automáticamente como el documento **Shipping Form (`isPurchaseInfoShippingDoc: true`)**.
+   - Momento 3 (`// 3. MEDICIÓN DE ESCRITURA EN DB (Firestore)`): Se persiste el resultado y las métricas de latencia en Firestore y se consolida para rellenar **MASTER SHIPPINGS**.
+
+2. REGLAS OFICIALES DE NOMENCLATURA REGEX:
+   - **VIP (`_V`, `VIP`)**: Fuente #1 de verdad para **Email** y **Teléfono** del cliente.
+   - **SHIPPING (`shipping.jpg`, `shipping form.jpg`) o Documento Tamaño Carta con `"Purchase information"`**: Fuente #1 de verdad para extraer **`Address 1 (Street)`**, **`City`**, **`Sales rep`** y **`Country`**.
+   - **PRIORIDAD ESTRICTA DE `Country`**: El `Country` extraído explícitamente del documento Shipping / `"Purchase information"` tiene **PRIORIDAD #1 ABSOLUTA** sobre el método de deducción por número de teléfono o código postal.
+   - **TICKET DE COMPRA (`n.jpg`, `_n`, `_nov`, `nova`, `invoice_XXXXX.jpg`)**: Fuente prioritaria para **`SALE DATE`**, **`Sales rep`**, **`Location - Store`** y **`Productos`**.
+   - **IDENTIDAD (`_id.jpg`, `pass`, `pp`, `id`)**: Prioritario para verificar ortografía de Nombre y Apellido manuscritos.
+   - **EXCLUSIONES ESTRICTAS (`gbk`, `5cc`, `50c`, `cid`, `ccid`)**: Ignorar siempre (material promocional o copias de tarjetas).
+
+3. Bloqueo de Teléfono Corporativo: El número '8882494189' (y '18882494189') es el teléfono corporativo de la empresa. Está ESTRICTAMENTE PROHIBIDO utilizarlo como teléfono del cliente.
+
+4. Búsqueda de Facturas (Invoices) y Relleno de MASTER SHIPPINGS:
+   - Cuando el usuario te pregunte por un número de invoice (ej. `19465`), usa primero `buscar_y_sanitizar_cliente` (que busca en todas las pestañas 2023, 2024, 2025 y 2026 de Customer Information y MASTER SHIPPINGS).
+   - Si el usuario quiere analizar los archivos escaneados en ShareFile o rellenar MASTER SHIPPINGS para un invoice, utiliza `escanear_y_rellenar_master_shippings` u `obtener_textos_de_archivos`.
+
+5. Actualización de campos del formulario en pantalla: Si el usuario te pide corregir, cambiar o actualizar un dato del cliente en el formulario, incluye en tu respuesta un bloque JSON con el siguiente formato EXACTO (sin backticks ni markdown):
+FIELD_UPDATE:{"name":"valor","lastName":"valor","telephone":"valor","email":"valor","address":"valor","city":"valor","state":"valor","zipCode":"valor","country":"valor","saleDate":"valor","salesRep":"valor","storeName":"valor","products":"valor"}
+Incluye SOLO los campos que el usuario quiere modificar.
+
+6. Guardado en Google Sheets (MASTER SHIPPINGS / Customer Information): Si el usuario solicita guardar o aplicar cambios en Google Sheets, utiliza `actualizar_registro_sheets` o `escanear_y_rellenar_master_shippings(invoice, guardar_en_sheets=True)`.
+
+7. Validación de correo electrónico: Utiliza `validar_correo` únicamente para un correo individual cuando el usuario lo solicite (prohibido validar en lote).""",
+    tools=[
+        buscar_y_sanitizar_cliente,
+        procesar_caso_zendesk,
+        obtener_textos_de_archivos,
+        escanear_y_rellenar_master_shippings,
+        actualizar_registro_sheets,
+        buscar_clientes,
+        validar_correo,
+    ],
 )
+
 
