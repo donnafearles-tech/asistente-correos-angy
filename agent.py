@@ -267,11 +267,11 @@ def consultar_productos_pendientes(invoice: str, buscar_compensaciones_o_regalos
             "cliente": cliente_nombre,
             "columna_m_shipping": "SI",
             "tiene_productos_pendientes": False,
-            "estado": "SIN_PRODUCTOS_EN_MASTER_SHIPPINGS",
-            "respuesta": "El invoice tiene SHIPPING: SI en Customer Information, pero actualmente no cuenta con productos registrados en la Columna M de MASTER SHIPPINGS ni se detectaron productos en negativo / devolución (_R.jpg).",
-            "productos_pendientes": "Ninguno en MASTER SHIPPINGS",
+            "estado": "NO_HAY_PRODUCTOS_PENDIENTES",
+            "respuesta": "No hay productos pendientes de envío para este invoice.",
+            "productos_pendientes": "",
             "columna_m_master_shippings": "Vacía",
-            "nota": "No se mencionan los productos de Customer Information - Shippings por regla estricta."
+            "nota": "Para un invoice sin productos en negativo y con SHIPPING: SI, NO se considera pendiente de envío ni se mencionan productos de Customer Information."
         }
 
     # CASO 2: SHIPPING == "NO"
@@ -1080,8 +1080,9 @@ Incluye SOLO los campos que el usuario quiere modificar.
        -> Se enviarán a **MASTER SHIPPINGS** los archivos/datos que estén en el invoice de **"Devolución"** o **"returns"** o productos con un signo de menos **"-"** en su invoice, tomando ese número de invoice con saldo negativo para crear la fila nueva en MASTER SHIPPINGS.
        -> **Al responder sobre productos pendientes**:
           1. Si existen ya productos en la **Columna M de MASTER SHIPPINGS**, **SOLO mencionarás esos productos**.
-          2. Si no están aún en MASTER SHIPPINGS, **SOLO mencionarás los productos de este invoice en negativo o devolución (`_R.jpg` / `-`)**.
-          3. **ESTÁ ESTRICTAMENTE PROHIBIDO mencionar los productos de la hoja Customer Information - Shippings**.
+           2. Si no están aún en MASTER SHIPPINGS pero el invoice contiene productos en negativo o devolución (`_R.jpg` / `-`), **SOLO mencionarás esos productos en negativo**.
+           3. **Si el invoice NO tiene productos en negativo ni está registrado en MASTER SHIPPINGS**: **NO se debe considerar pendiente de envío**. Tu respuesta inicial será: **"No hay productos pendientes de envío para este invoice."**
+           4. **ESTÁ ESTRICTAMENTE PROHIBIDO mencionar los productos de la hoja Customer Information - Shippings como productos pendientes de envío**.
      * **SI la Columna M (`SHIPPING`) dice "NO"**:
        -> **NUNCA mencionarás esos productos como "productos para enviar"**.
        -> Tu respuesta inicial será: **"No hay productos pendientes de envío para este invoice."**
