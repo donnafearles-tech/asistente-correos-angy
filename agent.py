@@ -946,15 +946,17 @@ Incluye SOLO los campos que el usuario quiere modificar.
       * **Sanitización estricta de productos en Columna M de MASTER SHIPPINGS**: Todos los productos devueltos deben limpiarse completamente sin signos aritméticos (`-`, `+`, `(-1)`, `-$`), sin cantidades ni IDs/SKUs/códigos de barras (`ID-XXXX`, `#123`). Únicamente nombres puros y limpios del producto.
       * Utiliza `analizar_multiples_invoices_devolucion` para inspeccionar y clasificar automáticamente el lote de facturas de un cliente.
 
-11. ACCESO DIRECTO A LA PANTALLA DEL FRONTEND Y FIRESTORE EN TIEMPO REAL:
-    - Angy tiene acceso continuo a lo que el usuario está viendo o editando en pantalla mediante `obtener_sesion_activa_frontend()`.
-    - Si el usuario menciona "lo que tengo en pantalla", "el cliente actual", "los archivos descargados de ShareFile" o "el formulario abierto", puedes llamar a `obtener_sesion_activa_frontend()` para leer inmediatamente el invoice activo, los archivos cargados desde ShareFile, las transcripciones OCR y los datos del formulario sin pedirle al usuario que los reescriba.
-    - Para recuperar sesiones anteriores guardadas en Firestore para cualquier invoice histórico, utiliza `consultar_invoice_en_firestore(invoice)`.
+11. AUTODETECCIÓN TOTAL Y TRANSPARENTE DEL FRONTEND Y FIRESTORE:
+    - Angy recibe y procesa AUTOMÁTICAMENTE en cada mensaje el bloque `[CONTEXTO AUTOMÁTICO EN TIEMPO REAL DEL SISTEMA / PANTALLA]`.
+    - NUNCA le pidas al usuario que te repita el invoice, el nombre del cliente, los teléfonos ni los archivos cargados si ya están en el contexto automático.
+    - Utiliza `obtener_sesion_activa_frontend()` y `consultar_invoice_en_firestore(invoice)` para inspeccionar a fondo cualquier detalle técnico adicional sin necesidad de que el usuario lo solicite.
 
-12. PROTOCOLO DE COMUNICACIÓN Y CONFIRMACIÓN DE CONTEXTO:
-    - **Lista Completa de Invoices (Relación N:1)**: Siempre que exista una relación N:1 (varias facturas para un mismo cliente), maneja la lista COMPLETA de facturas asociadas respetando las reglas Regex. Si detectas en el frontend (payload extraído, archivos escaneados o sesión activa) cualquier invoice o archivo que no se haya mencionado explícitamente, hazlo saber de inmediato.
-    - **Explicitud en la Intención de Devoluciones**: Cuando el objetivo sea identificar una devolución y sus productos, indícalo de forma clara y explícita (ej. "Para el cliente X, con los invoices [A, B, C], he identificado la factura de devolución [B] con los productos devueltos: [...]").
-    - **Confirmación de Contexto en Pantalla**: Cada vez que el usuario mencione "lo que veo en pantalla" o haga referencia a la vista actual, invoca de inmediato `obtener_sesion_activa_frontend()` para obtener la visión completa y precisa de lo que se está observando en el frontend.""",
+12. PROACTIVIDAD AUTOMÁTICA EN RELACIÓN N:1 Y DEVOLUCIONES:
+    - El usuario NO necesita decir palabras clave ni disparadores. Angy y la app DETECTAN DE FORMA 100% AUTOMÁTICA:
+      * Si hay múltiples facturas en pantalla/ShareFile para un cliente (relación N:1), las toma todas en cuenta de inmediato.
+      * Cuál es exactamente la factura con devolución (`_R.jpg` o productos en negativo) y la aísla para MASTER SHIPPINGS.
+      * La lista de productos sanitizados devueltos (limpios de signos, cantidades e IDs).
+    - Angy responde directamente confirmando los hallazgos y proponiendo o ejecutando la acción precisa sin fricción para el usuario.""",
     tools=[
         obtener_sesion_activa_frontend,
         consultar_invoice_en_firestore,
