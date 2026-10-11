@@ -197,11 +197,12 @@ def escanear_y_rellenar_master_shippings(invoice: str, guardar_en_sheets: bool =
     Extrae con prioridad:
     - 'Address 1 (Street)', 'City', 'Sales rep' y 'Country' desde el archivo Shipping o el archivo Tamaño Carta que contenga 'Purchase information'.
     - REGLA DE PAÍS: El 'Country' extraído explícitamente de este documento tiene PRIORIDAD ABSOLUTA sobre la deducción por número de teléfono.
-    Si guardar_en_sheets=True, escribe además los datos en MASTER SHIPPINGS y Customer Information.
+    - DEVOLUCIONES: Detecta archivos de devolución (R.jpg, RETURN.jpg, etc.) y saldos negativos para enviarlos a la Columna M de MASTER SHIPPINGS.
+    Si guardar_en_sheets=True, escribe además los datos en MASTER SHIPPINGS y Customer Information (creando la fila si no existe).
     """
     url = f"{BACKEND_URL}/api/scan-folder-and-process"
     try:
-        response = requests.post(url, json={"invoice": str(invoice).strip()}, timeout=90)
+        response = requests.post(url, json={"invoice": str(invoice).strip(), "targetSheetType": "both"}, timeout=90)
         if response.status_code != 200:
             return {"error": f"Error al escanear carpeta en ShareFile. Código: {response.status_code}, Detalle: {response.text}"}
         scan_data = response.json()
@@ -211,6 +212,8 @@ def escanear_y_rellenar_master_shippings(invoice: str, guardar_en_sheets: bool =
         extracted = scan_data.get("data") or {}
         sheet_update_result = None
         if guardar_en_sheets and extracted:
+            return_prods = extracted.get("returnProducts")
+            return_prods_str = "\n".join(return_prods) if isinstance(return_prods, list) else (str(return_prods) if return_prods else None)
             upd_res = actualizar_registro_sheets(
                 invoice=str(invoice).strip(),
                 nombre=extracted.get("name"),
@@ -226,6 +229,8 @@ def escanear_y_rellenar_master_shippings(invoice: str, guardar_en_sheets: bool =
                 vendedor=extracted.get("salesRep"),
                 tienda=extracted.get("storeName"),
                 productos=extracted.get("products"),
+                productos_devueltos=return_prods_str,
+                destino_hoja="ambas",
             )
             sheet_update_result = upd_res
 
@@ -257,11 +262,14 @@ def actualizar_registro_sheets(
     vendedor: str = None,
     tienda: str = None,
     productos: str = None,
+    productos_devueltos: str = None,
     shipping: str = None,
-    comentario: str = None
+    comentario: str = None,
+    destino_hoja: str = "ambas"
 ) -> dict:
     """
     Actualiza los datos de un cliente en Google Sheets (Customer Information y MASTER SHIPPINGS) para una factura específica.
+    Si el invoice no existe en MASTER SHIPPINGS, se crea automáticamente una nueva fila al final del año correspondiente.
     Usa esta herramienta cuando el usuario pida explícitamente guardar, corregir o actualizar datos en la hoja de cálculo.
     """
     columns_ek = {}
@@ -299,6 +307,12 @@ def actualizar_registro_sheets(
     extraction_data = {
         "columnsEK": columns_ek
     }
+    if nombre is not None: extraction_data["name"] = str(nombre).strip()
+    if apellido is not None: extraction_data["lastName"] = str(apellido).strip()
+    if telefono is not None: extraction_data["telephone"] = str(telefono).strip()
+    if email is not None: extraction_data["email"] = str(email).strip()
+    if productos is not None: extraction_data["productsText"] = str(productos).strip()
+    if productos_devueltos is not None: extraction_data["returnProducts"] = str(productos_devueltos).strip()
     if direccion is not None: extraction_data["address"] = str(direccion).strip()
     if ciudad is not None: extraction_data["city"] = str(ciudad).strip()
     if region is not None: extraction_data["state"] = str(region).strip()
@@ -308,15 +322,17 @@ def actualizar_registro_sheets(
     if vendedor is not None: extraction_data["salesRep"] = str(vendedor).strip()
     if tienda is not None: extraction_data["storeName"] = str(tienda).strip()
 
+    target_type = "master_shippings" if destino_hoja == "master_shippings" else ("both" if destino_hoja == "ambas" else "customer_info")
     payload = {
         "invoice": invoice,
         "comment": comentario,
+        "targetSheetType": target_type,
         "extractionData": extraction_data
     }
     
     url = f"{BACKEND_URL}/api/sheets/update"
     try:
-        response = requests.post(url, json=payload, timeout=20)
+        response = requests.post(url, json=payload, timeout=25)
         if response.status_code == 200:
             return response.json()
         return {"error": f"Error al actualizar Sheets. Código: {response.status_code}, Detalle: {response.text}"}
