@@ -178,75 +178,139 @@ def buscar_y_sanitizar_cliente(invoice: str) -> dict:
 
 def consultar_productos_pendientes(invoice: str, buscar_compensaciones_o_regalos: bool = False) -> dict:
     """
-    Consulta si un cliente tiene productos o envíos pendientes por recibir:
-    1. Si en Customer Information - Shippings (Columna M 'SHIPPING') dice 'SI' / 'YES':
-       - Se revisa la Columna M ('PRODUCTS') de MASTER SHIPPINGS y se extraen los productos pendientes.
-    2. Si en Customer Information - Shippings (Columna M 'SHIPPING') dice 'NO' / 'N':
-       - NO se extrae nada de ningún lado.
-       - Se responde directamente que 'No hay productos pendientes de envío.'
-       - Se le pregunta al usuario: '¿Deseas que haga una búsqueda de productos pedidos por algún agente por compensación o regalo?'
-       - Solo si buscar_compensaciones_o_regalos=True (o si el usuario pide buscar compensaciones), se examina MASTER SHIPPINGS.
+    Consulta si un cliente tiene productos o envíos pendientes por recibir siguiendo el protocolo estricto:
+    
+    1. Verificación previa en Customer Information - Shippings (Columna M 'SHIPPING'):
+       - Si la Columna M (SHIPPING) dice 'SI' o 'YES':
+         * Extrae los productos de la Columna M (PRODUCTS) de MASTER SHIPPINGS.
+         * Informa: 'Hay productos pendientes de envío' y lista esos productos.
+         
+       - Si la Columna M (SHIPPING) dice 'NO':
+         * NUNCA los menciona como 'productos para enviar'.
+         * Respuesta inicial: 'No hay productos pendientes de envío para este invoice.'
+         * Verificación de Retornos: Revisa si esos mismos productos están asociados a algún invoice clasificado como 'retorno' (archivos _R.jpg, RETURN.jpg o cantidades negativas).
+         * Si se encuentran como parte de un retorno en otro invoice: Lo hace saber explícitamente, indicando que son productos que el cliente ha retornado o que se le deben regresar.
+         * Si NO se encuentran como parte de un retorno: Pregunta obligatoriamente: '¿Deseas que haga una búsqueda de productos pedidos por algún agente por compensación o regalo?'
+         * Si buscar_compensaciones_o_regalos=True: Realiza la búsqueda en MASTER SHIPPINGS de compensaciones o regalos agregados por agentes.
     """
     clean_inv = str(invoice or "").strip()
     data = buscar_y_sanitizar_cliente(clean_inv)
     if "error" in data:
         return data
 
+    cliente_nombre = f"{data.get('nombre', '')} {data.get('apellido', '')}".strip()
     shipping_col_m_cust = str(data.get("shipping") or "").strip()
     is_shipping_no = shipping_col_m_cust.upper() in ["NO", "N"]
     is_shipping_yes = shipping_col_m_cust.upper() in ["YES", "SI"] or (bool(shipping_col_m_cust) and not is_shipping_no)
 
-    if is_shipping_no and not buscar_compensaciones_o_regalos:
-        # REGLA: Si dice NO, no se extrae nada de ningún lado.
+    # CASO 1: SHIPPING == "SI" / "YES"
+    if is_shipping_yes:
+        master_prod = str(data.get("master_shippings_products") or "").strip()
+        cust_prods = str(data.get("productos") or "").strip()
+        prods_extraidos = master_prod or cust_prods or "Envío registrado"
+
         return {
             "invoice": clean_inv,
-            "cliente": f"{data.get('nombre', '')} {data.get('apellido', '')}".strip(),
-            "tiene_productos_pendientes": False,
-            "respuesta": "No hay productos pendientes de envío.",
-            "productos_pendientes": "Ninguno",
-            "pregunta_al_usuario": "¿Deseas que haga una búsqueda de productos pedidos por algún agente por compensación o regalo?",
-            "columna_m_customer_info": shipping_col_m_cust or "NO"
+            "cliente": cliente_nombre,
+            "columna_m_shipping": "SI",
+            "tiene_productos_pendientes": True,
+            "estado": "PENDIENTES_DE_ENVIO",
+            "respuesta": f"Hay productos pendientes de envío para este invoice: {prods_extraidos}",
+            "productos_pendientes": prods_extraidos,
+            "columna_m_master_shippings": master_prod or "Vacía"
         }
 
-    if is_shipping_no and buscar_compensaciones_o_regalos:
-        # Búsqueda explícita de compensación / regalo en MASTER SHIPPINGS
+    # CASO 2: SHIPPING == "NO"
+    # 2.1 Búsqueda de retorno asociado en otros invoices del cliente
+    invoices_a_revisar = []
+    
+    # Revisar sesión activa de frontend
+    try:
+        sesion = obtener_sesion_activa_frontend()
+        if sesion.get("hay_sesion_activa"):
+            invs_sesion = sesion.get("invoices_detectados") or []
+            for inv in invs_sesion:
+                if str(inv).strip() and str(inv).strip() != clean_inv:
+                    invoices_a_revisar.append(str(inv).strip())
+    except Exception:
+        pass
+
+    # Si no hay invoices en sesión activa, buscar otros invoices del mismo cliente en Sheets
+    if not invoices_a_revisar and (cliente_nombre or data.get("email_sanitizado") or data.get("telefono_sanitizado")):
+        filtro = cliente_nombre or data.get("email_sanitizado") or clean_inv
+        try:
+            busq = buscar_clientes(filtro=filtro)
+            for r in busq.get("resultados", []):
+                inv_r = str(r.get("invoice") or "").strip()
+                if inv_r and inv_r != clean_inv and inv_r not in invoices_a_revisar:
+                    invoices_a_revisar.append(inv_r)
+        except Exception:
+            pass
+
+    # Analizar si alguno de los invoices relacionados tiene retorno (_R.jpg o negativo)
+    retorno_encontrado = None
+    if invoices_a_revisar:
+        try:
+            analisis_dev = analizar_multiples_invoices_devolucion([clean_inv] + invoices_a_revisar)
+            if analisis_dev.get("hay_devolucion"):
+                inv_dev = analisis_dev.get("invoice_con_devolucion")
+                prods_dev = analisis_dev.get("productos_devueltos_sanitizados") or []
+                if inv_dev and inv_dev != clean_inv:
+                    retorno_encontrado = {
+                        "invoice_retorno": inv_dev,
+                        "productos_retornados": ", ".join(prods_dev) if prods_dev else "Productos en retorno"
+                    }
+        except Exception:
+            pass
+
+    # Si se encontró retorno
+    if retorno_encontrado:
+        prods_ret = retorno_encontrado["productos_retornados"]
+        inv_ret = retorno_encontrado["invoice_retorno"]
+        return {
+            "invoice": clean_inv,
+            "cliente": cliente_nombre,
+            "columna_m_shipping": "NO",
+            "tiene_productos_pendientes": False,
+            "estado": "PRODUCTOS_EN_RETORNO",
+            "respuesta_inicial": "No hay productos pendientes de envío para este invoice.",
+            "detalle_retorno": f"Los productos ({prods_ret}) se encuentran registrados como parte de un 'retorno' en el invoice {inv_ret} (archivos de devolución _R.jpg / cantidades negativas). Son productos que el cliente ha retornado o que se le deben regresar.",
+            "invoice_retorno": inv_ret,
+            "productos_retornados": prods_ret
+        }
+
+    # Si NO se encontró retorno pero se pidió buscar compensación/regalo
+    if buscar_compensaciones_o_regalos:
         master_prod = str(data.get("master_shippings_products") or "").strip()
         if master_prod:
             return {
                 "invoice": clean_inv,
-                "cliente": f"{data.get('nombre', '')} {data.get('apellido', '')}".strip(),
+                "cliente": cliente_nombre,
+                "columna_m_shipping": "NO",
                 "tiene_productos_pendientes": True,
                 "es_compensacion_o_regalo": True,
                 "respuesta": f"Se encontraron productos registrados por un agente en MASTER SHIPPINGS por compensación o regalo: {master_prod}",
-                "productos_pendientes": master_prod,
-                "columna_m_customer_info": shipping_col_m_cust,
-                "columna_m_master_shippings": master_prod
+                "productos_compensacion": master_prod
             }
         else:
             return {
                 "invoice": clean_inv,
-                "cliente": f"{data.get('nombre', '')} {data.get('apellido', '')}".strip(),
+                "cliente": cliente_nombre,
+                "columna_m_shipping": "NO",
                 "tiene_productos_pendientes": False,
                 "es_compensacion_o_regalo": False,
-                "respuesta": "No se encontraron compensaciones ni regalos agregados por agentes en MASTER SHIPPINGS.",
-                "productos_pendientes": "Ninguno",
-                "columna_m_customer_info": shipping_col_m_cust,
-                "columna_m_master_shippings": "Vacía"
+                "respuesta": "No se encontraron compensaciones ni regalos agregados por agentes en MASTER SHIPPINGS."
             }
 
-    # Si en Customer Information dice SI (o tiene envío):
-    master_prod = str(data.get("master_shippings_products") or "").strip()
-    cust_prods = str(data.get("productos") or "").strip()
-    prods_extraidos = master_prod or cust_prods or "Envío registrado"
-
+    # Si NO hay retorno y NO se ha pedido compensación:
     return {
         "invoice": clean_inv,
-        "cliente": f"{data.get('nombre', '')} {data.get('apellido', '')}".strip(),
-        "tiene_productos_pendientes": True,
-        "respuesta": f"Tiene productos pendientes de envío: {prods_extraidos}",
-        "productos_pendientes": prods_extraidos,
-        "columna_m_customer_info": shipping_col_m_cust or "YES",
-        "columna_m_master_shippings": master_prod or "Vacía"
+        "cliente": cliente_nombre,
+        "columna_m_shipping": "NO",
+        "tiene_productos_pendientes": False,
+        "estado": "SIN_ENVIOS_NI_RETORNOS",
+        "respuesta_inicial": "No hay productos pendientes de envío para este invoice.",
+        "pregunta_obligatoria": "¿Deseas que haga una búsqueda de productos pedidos por algún agente por compensación o regalo?"
     }
 
 def procesar_caso_zendesk(invoice: str, nombre: str, email: str, telefono: str, tienda: str, region: str) -> dict:
@@ -912,21 +976,25 @@ Incluye SOLO los campos que el usuario quiere modificar.
 
 7. Validación de correo electrónico: Utiliza `validar_correo` únicamente para un correo individual cuando el usuario lo solicite (prohibido validar en lote).
 
-8. DISTINCIÓN DE HOJAS DE CÁLCULO Y REGLA LÓGICA DE PRODUCTOS PENDIENTES:
+8. DISTINCIÓN DE HOJAS DE CÁLCULO Y REGLA LÓGICA DE PRODUCTOS PENDIENTES / RETORNOS:
    - Existen dos hojas de cálculo independientes que NUNCA debes confundir:
      * **Hoja 1**: `Customer Information - Shippings` (ID: `1-D0F025w23P9daLlLsfcGAbi9o_pnM1A_p70WtlZdK4`).
        -> Su **Columna M** es **`SHIPPING`** (indica si la venta requirió envío: "NO", "YES", "SI").
      * **Hoja 2**: `MASTER SHIPPINGS` (ID: `1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY`).
        -> Su **Columna M** es **`PRODUCTS`** (registra productos a despachar, devoluciones, o compensaciones/regalos agregados por un agente).
    - REGLA LÓGICA DE RESPUESTA A PRODUCTOS PENDIENTES:
-     * **SI la Columna M (`SHIPPING`) en Customer Information dice "SI" / "YES"**:
-       -> Se revisa la **Columna M (`PRODUCTS`)** de **MASTER SHIPPINGS** y se extraen los productos para responder al usuario con la lista de productos pendientes de envío.
-     * **SI la Columna M (`SHIPPING`) en Customer Information dice "NO"**:
-       -> **NO se extrae nada de ningún lado**.
-       -> Se responde simplemente que **"No hay productos pendientes de envío."**
-       -> Y obligatoriamente se le pregunta al usuario: **"¿Deseas que haga una búsqueda de productos pedidos por algún agente por compensación o regalo?"**
+     * **Antes de mencionar cualquier producto**, verificarás la Columna M (`SHIPPING`) en la hoja `Customer Information - Shippings` para el invoice correspondiente (mediante `consultar_productos_pendientes(invoice)`).
+     * **SI la Columna M (`SHIPPING`) dice "SI" o "YES"**:
+       -> Extraerás los productos de la **Columna M (`PRODUCTS`)** de **MASTER SHIPPINGS**.
+       -> Informarás que: **"Hay productos pendientes de envío"** y listarás esos productos.
+     * **SI la Columna M (`SHIPPING`) dice "NO"**:
+       -> **NUNCA mencionarás esos productos como "productos para enviar"**.
+       -> Tu respuesta inicial será: **"No hay productos pendientes de envío para este invoice."**
+       -> Posteriormente, verificarás si esos mismos productos están asociados a algún invoice que haya sido clasificado como "return" o "retorno" (aquellos con archivos `_R.jpg`, `RETURN.jpg`, `_r.jpg` o cantidades negativas de productos).
+       -> **Si los productos de este invoice (con SHIPPING "NO") se encuentran registrados como parte de un "retorno" en otro invoice**: Se lo harás saber explícitamente al usuario, indicando que **son productos que el cliente ha retornado o que se le deben regresar**.
+       -> **Si NO se encuentran como parte de un "retorno"**: Preguntarás obligatoriamente: **"¿Deseas que haga una búsqueda de productos pedidos por algún agente por compensación o regalo?"**
      * **BÚSQUEDA DE COMPENSACIÓN O REGALO (Bajo solicitud explícita del usuario)**:
-       -> Si el usuario responde afirmativamente a la pregunta o pide explícitamente revisar compensaciones/regalos, entonces se utiliza `consultar_productos_pendientes(invoice, buscar_compensaciones_o_regalos=True)` para examinar la Columna M de MASTER SHIPPINGS y reportar si un agente agregó productos.
+       -> Solo si el usuario lo solicita explícitamente (o responde afirmativamente a tu pregunta), se consulta MASTER SHIPPINGS con `consultar_productos_pendientes(invoice, buscar_compensaciones_o_regalos=True)` para verificar si un agente agregó productos por compensación o regalo.
 
 9. Búsqueda y Asignación de External ID en Zendesk:
    - Cuando el usuario pregunte si un cliente existe en Zendesk (o pida buscar por correo, teléfono o nombre):
