@@ -176,13 +176,16 @@ def buscar_y_sanitizar_cliente(invoice: str) -> dict:
     except Exception as e:
         return {"error": f"Error de conexión con el backend: {str(e)}"}
 
-def consultar_productos_pendientes(invoice: str) -> dict:
+def consultar_productos_pendientes(invoice: str, buscar_compensaciones_o_regalos: bool = False) -> dict:
     """
-    Consulta si un cliente tiene productos o envíos pendientes por recibir, evaluando conjuntamente las 2 hojas:
-    1. Hoja 1 - Customer Information - Shippings (1-D0F025w23P9daLlLsfcGAbi9o_pnM1A_p70WtlZdK4):
-       - Columna M ('SHIPPING'): Si tiene un 'NO', por consecuencia lógica la respuesta a si tiene productos pendientes es 'NO'.
-    2. Hoja 2 - MASTER SHIPPINGS (1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY):
-       - Columna M ('PRODUCTS'): Revisa rápidamente casos límite donde un humano agregó manualmente productos por enviar debido a compensaciones, regalos o devoluciones.
+    Consulta si un cliente tiene productos o envíos pendientes por recibir:
+    1. Si en Customer Information - Shippings (Columna M 'SHIPPING') dice 'SI' / 'YES':
+       - Se revisa la Columna M ('PRODUCTS') de MASTER SHIPPINGS y se extraen los productos pendientes.
+    2. Si en Customer Information - Shippings (Columna M 'SHIPPING') dice 'NO' / 'N':
+       - NO se extrae nada de ningún lado.
+       - Se responde directamente que 'No hay productos pendientes de envío.'
+       - Se le pregunta al usuario: '¿Deseas que haga una búsqueda de productos pedidos por algún agente por compensación o regalo?'
+       - Solo si buscar_compensaciones_o_regalos=True (o si el usuario pide buscar compensaciones), se examina MASTER SHIPPINGS.
     """
     clean_inv = str(invoice or "").strip()
     data = buscar_y_sanitizar_cliente(clean_inv)
@@ -191,56 +194,59 @@ def consultar_productos_pendientes(invoice: str) -> dict:
 
     shipping_col_m_cust = str(data.get("shipping") or "").strip()
     is_shipping_no = shipping_col_m_cust.upper() in ["NO", "N"]
-    
-    master_prod = str(data.get("master_shippings_products") or "").strip()
-    has_human_addition = bool(master_prod)
+    is_shipping_yes = shipping_col_m_cust.upper() in ["YES", "SI"] or (bool(shipping_col_m_cust) and not is_shipping_no)
 
-    # REGLA LÓGICA ESTRICTA:
-    # Si Columna M de Customer Information es "NO" -> Por consecuencia lógica la respuesta es "NO",
-    # salvo caso límite donde un humano haya agregado en MASTER SHIPPINGS una compensación o regalo.
-    if is_shipping_no:
-        if has_human_addition:
-            tiene_pendientes = True
-            estado = f"SÍ (Caso límite detectado: Aunque la Columna M de Customer Information es 'NO', un humano agregó productos por enviar en MASTER SHIPPINGS por compensación/regalo: {master_prod})"
-            detalles = master_prod
+    if is_shipping_no and not buscar_compensaciones_o_regalos:
+        # REGLA: Si dice NO, no se extrae nada de ningún lado.
+        return {
+            "invoice": clean_inv,
+            "cliente": f"{data.get('nombre', '')} {data.get('apellido', '')}".strip(),
+            "tiene_productos_pendientes": False,
+            "respuesta": "No hay productos pendientes de envío.",
+            "productos_pendientes": "Ninguno",
+            "pregunta_al_usuario": "¿Deseas que haga una búsqueda de productos pedidos por algún agente por compensación o regalo?",
+            "columna_m_customer_info": shipping_col_m_cust or "NO"
+        }
+
+    if is_shipping_no and buscar_compensaciones_o_regalos:
+        # Búsqueda explícita de compensación / regalo en MASTER SHIPPINGS
+        master_prod = str(data.get("master_shippings_products") or "").strip()
+        if master_prod:
+            return {
+                "invoice": clean_inv,
+                "cliente": f"{data.get('nombre', '')} {data.get('apellido', '')}".strip(),
+                "tiene_productos_pendientes": True,
+                "es_compensacion_o_regalo": True,
+                "respuesta": f"Se encontraron productos registrados por un agente en MASTER SHIPPINGS por compensación o regalo: {master_prod}",
+                "productos_pendientes": master_prod,
+                "columna_m_customer_info": shipping_col_m_cust,
+                "columna_m_master_shippings": master_prod
+            }
         else:
-            tiene_pendientes = False
-            estado = "NO (La Columna M 'SHIPPING' en Customer Information es 'NO' y no hay compensaciones ni regalos en MASTER SHIPPINGS)"
-            detalles = "Ninguno"
-    else:
-        # Si no es "NO" (ej. "YES", "SI" o tiene envío registrado)
-        if has_human_addition:
-            tiene_pendientes = True
-            estado = f"SÍ (Productos registrados en MASTER SHIPPINGS: {master_prod})"
-            detalles = master_prod
-        elif data.get("productos"):
-            tiene_pendientes = True
-            estado = f"SÍ (Envío solicitado con productos: {data.get('productos')})"
-            detalles = str(data.get("productos"))
-        else:
-            tiene_pendientes = bool(shipping_col_m_cust)
-            estado = "SÍ (Envío registrado)" if tiene_pendientes else "NO (Sin productos pendientes)"
-            detalles = shipping_col_m_cust or "Ninguno"
+            return {
+                "invoice": clean_inv,
+                "cliente": f"{data.get('nombre', '')} {data.get('apellido', '')}".strip(),
+                "tiene_productos_pendientes": False,
+                "es_compensacion_o_regalo": False,
+                "respuesta": "No se encontraron compensaciones ni regalos agregados por agentes en MASTER SHIPPINGS.",
+                "productos_pendientes": "Ninguno",
+                "columna_m_customer_info": shipping_col_m_cust,
+                "columna_m_master_shippings": "Vacía"
+            }
+
+    # Si en Customer Information dice SI (o tiene envío):
+    master_prod = str(data.get("master_shippings_products") or "").strip()
+    cust_prods = str(data.get("productos") or "").strip()
+    prods_extraidos = master_prod or cust_prods or "Envío registrado"
 
     return {
         "invoice": clean_inv,
         "cliente": f"{data.get('nombre', '')} {data.get('apellido', '')}".strip(),
-        "tiene_productos_pendientes": tiene_pendientes,
-        "respuesta_resumen": "SI" if tiene_pendientes else "NO",
-        "estado_detallado": estado,
-        "productos_pendientes": detalles,
-        "hoja_customer_info": {
-            "id": "1-D0F025w23P9daLlLsfcGAbi9o_pnM1A_p70WtlZdK4",
-            "nombre": "Customer Information - Shippings",
-            "columna_m_shipping": shipping_col_m_cust or "No especificado"
-        },
-        "hoja_master_shippings": {
-            "id": "1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY",
-            "nombre": "MASTER SHIPPINGS",
-            "columna_m_products": master_prod or "Vacía",
-            "encontrado_en_master": data.get("found_in_master", False)
-        },
-        "pestaña_año": data.get("year_tab", "")
+        "tiene_productos_pendientes": True,
+        "respuesta": f"Tiene productos pendientes de envío: {prods_extraidos}",
+        "productos_pendientes": prods_extraidos,
+        "columna_m_customer_info": shipping_col_m_cust or "YES",
+        "columna_m_master_shippings": master_prod or "Vacía"
     }
 
 def procesar_caso_zendesk(invoice: str, nombre: str, email: str, telefono: str, tienda: str, region: str) -> dict:
@@ -831,6 +837,42 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
     }
 
 
+def obtener_sesion_activa_frontend() -> dict:
+    """Obtiene en tiempo real los datos cargados en la pantalla del usuario (frontend) y sincronizados en Firestore.
+    Incluye: el invoice actual, datos del cliente (nombre, email, teléfono, dirección, etc.), archivos descargados de ShareFile, productos normales y productos de devolución, y estado del escaneo."""
+    try:
+        url = f"{BACKEND_URL}/api/session/active"
+        req = urllib.request.Request(url, headers={"User-Agent": "AngyAgent/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            return {
+                "estado": "exito",
+                "origen": data.get("source", "memoria/firestore"),
+                "sesion_pantalla": data.get("session", {})
+            }
+    except Exception as e:
+        return {
+            "estado": "error",
+            "mensaje": f"No se pudo consultar la sesión activa del frontend: {str(e)}"
+        }
+
+
+def consultar_invoice_en_firestore(invoice: str) -> dict:
+    """Consulta en Firestore la sesión persistida, telemetría y resultados de OCR previamente guardados para un número de invoice específico."""
+    try:
+        safe_inv = str(invoice).strip()
+        url = f"{BACKEND_URL}/api/firestore/invoice-session?invoice={urllib.parse.quote(safe_inv)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "AngyAgent/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            return data
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Error consultando Firestore para invoice {invoice}: {str(e)}"
+        }
+
+
 root_agent = Agent(
     model='gemini-2.5-flash',
     name='root_agent',
@@ -875,15 +917,16 @@ Incluye SOLO los campos que el usuario quiere modificar.
      * **Hoja 1**: `Customer Information - Shippings` (ID: `1-D0F025w23P9daLlLsfcGAbi9o_pnM1A_p70WtlZdK4`).
        -> Su **Columna M** es **`SHIPPING`** (indica si la venta requirió envío: "NO", "YES", "SI").
      * **Hoja 2**: `MASTER SHIPPINGS` (ID: `1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY`).
-       -> Su **Columna M** es **`PRODUCTS`** (registra productos a despachar, devoluciones, o compensaciones/regalos agregados por un humano).
+       -> Su **Columna M** es **`PRODUCTS`** (registra productos a despachar, devoluciones, o compensaciones/regalos agregados por un agente).
    - REGLA LÓGICA DE RESPUESTA A PRODUCTOS PENDIENTES:
-     * Si en la **Columna M (`SHIPPING`)** de **Customer Information - Shippings** (`1-D0F025w23P9daLlLsfcGAbi9o_pnM1A_p70WtlZdK4`) tenemos un **"NO"**:
-       -> Por consecuencia lógica, la respuesta a si el cliente tiene productos pendientes por recibir será **"NO"** (el cliente se llevó su compra en tienda o no requirió envío).
-     * **CASOS LÍMITE / REVISIÓN RÁPIDA DE EXCEPCIONES**:
-       -> Revisa rápidamente en **MASTER SHIPPINGS** (`1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY`) en la **Columna M (`PRODUCTS`)** o notas si un operador humano agregó algún producto por enviar debido a una **compensación**, **regalo** o reemplazo.
-       -> Si un humano agregó un regalo o compensación en MASTER SHIPPINGS: Responde que como caso límite existe ese regalo/compensación registrado para envío.
-       -> Si MASTER SHIPPINGS está vacío o no tiene productos agregados: La respuesta es definitivamente **"NO"** (sin productos pendientes).
-     * Utiliza la herramienta `consultar_productos_pendientes(invoice)` para obtener automáticamente esta evaluación combinada.
+     * **SI la Columna M (`SHIPPING`) en Customer Information dice "SI" / "YES"**:
+       -> Se revisa la **Columna M (`PRODUCTS`)** de **MASTER SHIPPINGS** y se extraen los productos para responder al usuario con la lista de productos pendientes de envío.
+     * **SI la Columna M (`SHIPPING`) en Customer Information dice "NO"**:
+       -> **NO se extrae nada de ningún lado**.
+       -> Se responde simplemente que **"No hay productos pendientes de envío."**
+       -> Y obligatoriamente se le pregunta al usuario: **"¿Deseas que haga una búsqueda de productos pedidos por algún agente por compensación o regalo?"**
+     * **BÚSQUEDA DE COMPENSACIÓN O REGALO (Bajo solicitud explícita del usuario)**:
+       -> Si el usuario responde afirmativamente a la pregunta o pide explícitamente revisar compensaciones/regalos, entonces se utiliza `consultar_productos_pendientes(invoice, buscar_compensaciones_o_regalos=True)` para examinar la Columna M de MASTER SHIPPINGS y reportar si un agente agregó productos.
 
 9. Búsqueda y Asignación de External ID en Zendesk:
    - Cuando el usuario pregunte si un cliente existe en Zendesk (o pida buscar por correo, teléfono o nombre):
@@ -901,8 +944,15 @@ Incluye SOLO los campos que el usuario quiere modificar.
       * Las facturas estándar de compra (sin devolución) se registran únicamente en **Customer Information - Shippings**.
       * **Casos límite (múltiples invoices en la carpeta)**: Si el usuario o el sistema proveen 2 números pero en la carpeta existen 3 o más, Angy y la app deben inspeccionar los archivos e identificar con precisión cuál es el número de invoice con la devolución negativa.
       * **Sanitización estricta de productos en Columna M de MASTER SHIPPINGS**: Todos los productos devueltos deben limpiarse completamente sin signos aritméticos (`-`, `+`, `(-1)`, `-$`), sin cantidades ni IDs/SKUs/códigos de barras (`ID-XXXX`, `#123`). Únicamente nombres puros y limpios del producto.
-      * Utiliza `analizar_multiples_invoices_devolucion` para inspeccionar y clasificar automáticamente el lote de facturas de un cliente.""",
+      * Utiliza `analizar_multiples_invoices_devolucion` para inspeccionar y clasificar automáticamente el lote de facturas de un cliente.
+
+11. ACCESO DIRECTO A LA PANTALLA DEL FRONTEND Y FIRESTORE EN TIEMPO REAL:
+    - Angy tiene acceso continuo a lo que el usuario está viendo o editando en pantalla mediante `obtener_sesion_activa_frontend()`.
+    - Si el usuario menciona "lo que tengo en pantalla", "el cliente actual", "los archivos descargados de ShareFile" o "el formulario abierto", puedes llamar a `obtener_sesion_activa_frontend()` para leer inmediatamente el invoice activo, los archivos cargados desde ShareFile, las transcripciones OCR y los datos del formulario sin pedirle al usuario que los reescriba.
+    - Para recuperar sesiones anteriores guardadas en Firestore para cualquier invoice histórico, utiliza `consultar_invoice_en_firestore(invoice)`.""",
     tools=[
+        obtener_sesion_activa_frontend,
+        consultar_invoice_en_firestore,
         buscar_y_sanitizar_cliente,
         consultar_productos_pendientes,
         analizar_multiples_invoices_devolucion,
