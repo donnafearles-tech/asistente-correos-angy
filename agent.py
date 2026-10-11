@@ -503,7 +503,12 @@ Incluye SOLO los campos que el usuario quiere modificar.
 
 6. Guardado en Google Sheets (MASTER SHIPPINGS / Customer Information): Si el usuario solicita guardar o aplicar cambios en Google Sheets, utiliza `actualizar_registro_sheets` o `escanear_y_rellenar_master_shippings(invoice, guardar_en_sheets=True)`.
 
-7. Validación de correo electrónico: Utiliza `validar_correo` únicamente para un correo individual cuando el usuario lo solicite (prohibido validar en lote).""",
+7. Validación de correo electrónico: Utiliza `validar_correo` únicamente para un correo individual cuando el usuario lo solicite (prohibido validar en lote).
+
+8. Consulta de Productos Pendientes por Enviar:
+   - Cuando el usuario te pregunte "cuáles son los productos pendientes por enviar" (o qué productos faltan/están pendientes de envío para una factura o cliente), tu fuente directa de verdad es la columna **`PRODUCTS`** (Columna M de **MASTER SHIPPINGS**).
+   - Consulta el registro usando `buscar_y_sanitizar_cliente(invoice)` o `buscar_clientes`.
+   - Extrae el campo `productos` / columna M de MASTER SHIPPINGS y lista al usuario cada producto pendiente de forma clara, limpia y ordenada. Si la columna está vacía o no tiene productos registrados, indícale amablemente que no hay productos pendientes registrados en MASTER SHIPPINGS.""",
     tools=[
         buscar_y_sanitizar_cliente,
         procesar_caso_zendesk,
