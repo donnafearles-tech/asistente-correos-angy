@@ -27,24 +27,80 @@ REGEX_EXCLUDED = re.compile(r"(?:gbk|5cc|50c|ccid|(?<![a-z])cid(?![a-z]))", re.I
 REGEX_RETURN = re.compile(r"(?:^|[_\s.-])(?:r|ret|returns?|refunds?|devoluci[oó]n)(?:[_\s.-]\d*|\d+|$)", re.IGNORECASE)
 
 
+REGEX_EXCLUDE_DISCARD_LINE = re.compile(
+    r"(?:"
+    r"all\s+sales\s+are\s+final|"
+    r"by\s+signing\s+(?:the\s+above|below)|"
+    r"acknowledge\s+that|"
+    r"exchanges?\s+for\s+unopened|"
+    r"reconozco\s+la\s+posibilidad|"
+    r"diferencias?\s+en\s+el\s+monto|"
+    r"ground\s+free|"
+    r"business\s+days?\s+express\s+delivery|"
+    r"ship\s*date|"
+    r"standard\s+shipping|"
+    r"exchange\s+rate|"
+    r"transacci[oó]n\s+en\s+d[oó]lares|"
+    r"afiliaci[oó]n|"
+    r"terminal\s*:\s*.*|"
+    r"please\s+sign\s*&?\s*confirm|"
+    r"visit\s+us\s+at|"
+    r"morena\s+mia\s+beauty\s+group|"
+    r"empire\s+tech(?:\s+cosmetics)?|"
+    r"empire\s+ssa4|"
+    r"chief\s+administrator|"
+    r"driver'?s?\s*license|"
+    r"endorsements?|"
+    r"restrictions?|"
+    r"\b(?:bbva|bancomer)\b|"
+    r"\bus\s+toll\s+free\b|"
+    r"\b(?:mvc|njcn\w+|rnqj\w+)\b|"
+    r"c[\s-]*o[\s-]*m[\s-]*e[\s-]*r[\s-]*c[\s-]*i[\s-]*o|"
+    r"\b(?:dob|exp|gender|hgt|eyes|class\s*d)\s*:|"
+    r"\b(?:phone|email|telephone|tel[eé]fono)\s*:|"
+    r"\b(?:city|state|zip\s*code|country|address)\s*:|"
+    r"^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b|"
+    r"^\+?1?\s*\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}$"
+    r")",
+    re.IGNORECASE
+)
+
+PALABRAS_INVALIDAS_DEVOLUCION = {
+    "return", "refund", "returns", "refunds", "devolucion", "devolución",
+    "void", "cancel", "cambio", "exchange", "item", "items", "producto",
+    "productos", "total", "subtotal", "tax", "date", "customer", "signature",
+    "visa", "mastercard", "amex", "cash", "credit", "debit", "sale", "invoice",
+    "phone", "email", "rev", "us toll free#", "commerce", "c-o-m-e-r-c-i-o", "ssa4",
+    "bbva", "transaccion en dolares", "afiliacion", "fecha", "rnqj6azmem", "njcn6m01",
+    "mvc", "chief administrator", "dl r6696", "class d", "endorsements", "restrictions",
+    "visit us at", "empire ssa4", "terminal", "terminal: vs i@", "ground free",
+    "business days express delivery", "ship date", "dob", "exp", "gender", "hgt", "eyes"
+}
+
+
 def sanitizar_producto_devolucion(nombre: str) -> str:
     """
-    Sanitiza el nombre de un producto devuelto o negativo eliminando:
-    - Signos aritméticos (+, -, parentesis)
-    - Cantidades negativas (-1, -2, Qty -1, (-1))
-    - Precios (-$100.00, $ -50.00, -150.00)
-    - Prefijos de nombres de archivo (ej. EMPIRETECHSSA4_233145_R.jpg - )
-    - Prefijos de cabeceras de devolución (RETURNED:, REFUNDED:, etc.)
-    - Códigos de producto, IDs y SKUs (ID-12345, SKU 99, ITEM #12)
-    - Palabras genéricas aisladas de totales o cabeceras
+    Sanitiza el nombre de un producto devuelto o negativo para MASTER SHIPPINGS (Columna M):
+    1. Signos aritméticos y simbolismos monetarios (+, -, (, ), $, %, $XX.XX, -1, x2, 3pcs, 50% OFF, -$XX.XX)
+    2. Identificadores y códigos (IDs de producto, SKUs, códigos de barras, ID-XXXX, #123, SKU-Y, UPC: ZZZ)
+    3. Información de contacto y datos personales (PHONE:, 609-707-4463, EMAIL:, direcciones, DOB, EXP, GENDER, HGT, EYES, DL, CLASS D, MVC, Chief Administrator)
+    4. Términos y condiciones, descargos y legalidades ('All sales are final', políticas de venta, garantías)
+    5. Información de envío y logística (Ground Free, Business Days Express Delivery, SHIP DATE)
+    6. Información de transacción y pagos (Exchange Rate, TRANSACCION EN DOLARES, AFILIACION, Terminal: VS I@, BBVA)
+    7. Palabras genéricas o ruido de OCR (Commerce, C-O-M-E-R-C-I-O, SSA4, RNQJ6AZMEM, NJCN6M01, Visit us at, nombres corporativos)
+    Criterios de INCLUSIÓN: Preserva nombres puros como 'HYDRA . SILK', 'ACTIVING ELIXIR', 'ATOMIC HEATING MASK', 'D.TOX Peeling', 'C.TOX Moisturizer', 'Do'r24K Milk Cleanser', 'SOLOS', 'A.TOX Syringe'.
     """
     if not nombre:
         return ""
     s = str(nombre).strip()
-    
+
+    # 0. Descarte inmediato por criterios de exclusión (legalidades, envíos, terminales, bancos, contacto, licencias, ruido OCR)
+    if REGEX_EXCLUDE_DISCARD_LINE.search(s):
+        return ""
+
     # 1. Eliminar prefijos de archivos comunes
     s = re.sub(r"^[A-Za-z0-9_-]+\.(?:jpe?g|png|pdf|tiff?)\s*[-–—:]*\s*", "", s, flags=re.I)
-    
+
     # 2. Eliminar prefijos de cabeceras de devolución / retorno
     s = re.sub(
         r"^(?:returned\s+items?|refunded\s+items?|return\s+items?|productos?\s+devueltos?|items?\s+retornados?|returned|refunded|return|refund|devoluci[oó]n|retorno|void|exchange|cambio)\s*[:–—-]*\s*",
@@ -52,52 +108,52 @@ def sanitizar_producto_devolucion(nombre: str) -> str:
         s,
         flags=re.I
     )
-    
+
     # 3. Eliminar paréntesis con signo negativo, precios o cantidades
     s = re.sub(r"\(\s*-\s*\$?\s*\d+(?:\.\d+)?\s*\)", "", s)
     s = re.sub(r"\(\s*\$?\s*\d+(?:\.\d+)?\s*-\s*\)", "", s)
-    s = re.sub(r"\(\s*-\s*\d+\s*(?:x|ea|pc|units?|unidades?)?\s*\)", "", s, flags=re.I)
+    s = re.sub(r"\(\s*-\s*\d+\s*(?:x|ea|pc|units?|unidades?|pcs)?\s*\)", "", s, flags=re.I)
     s = re.sub(r"\(\s*(?:qty|cant|cantidad|retornar|retorno)\s*[:x-]?\s*-?\d+[^)]*\)", "", s, flags=re.I)
     s = re.sub(r"\(\s*cantidad\s*-\s*\d+[^)]*\)", "", s, flags=re.I)
-    
-    # 4. Eliminar importes y precios negativos o positivos
+
+    # 4. Eliminar importes y precios negativos o positivos y porcentajes de descuento
     s = re.sub(r"-\s*\$\s*\d+(?:\.\d+)?", "", s)
     s = re.sub(r"\$\s*-\s*\d+(?:\.\d+)?", "", s)
     s = re.sub(r"\$\s*\d+(?:\.\d+)?", "", s)
+    s = re.sub(r"\b\d+\s*%\s*(?:off|discount|descuento)?\b", "", s, flags=re.I)
     s = re.sub(r"\b\d+\.\d{2}\b", "", s)
-    
+
     # 5. Eliminar cantidades y unidades negativas o normales al inicio/final
-    s = re.sub(r"^[+-]?\s*\d*\s*(?:x|ea|pc|units?|unidades?)\s*", "", s, flags=re.I)
+    s = re.sub(r"^[+-]?\s*\d*\s*(?:x|ea|pc|units?|unidades?|pcs)\s*", "", s, flags=re.I)
     s = re.sub(r"^[+-]\s*\d+\s*", "", s)
     s = re.sub(r"\b(?:qty|cant|cantidad|retornar|retorno)\s*[:x-]?\s*-?\d+\b", "", s, flags=re.I)
-    s = re.sub(r"[-–—]\s*\d+\s*(?:x|ea|pc|units?|unidades?)?\s*$", "", s, flags=re.I)
-    
+    s = re.sub(r"[-–—]\s*\d+\s*(?:x|ea|pc|units?|unidades?|pcs)?\s*$", "", s, flags=re.I)
+    s = re.sub(r"\b\d+\s*(?:pcs|pc|ea|units?|unidades?)\b", "", s, flags=re.I)
+
     # 6. Eliminar totales, subtotales, impuestos y balance
     s = re.sub(r"\b(?:price|precio|total|subtotal|sub-total|amount|tax|balance\s*due)\b[^\n]*", "", s, flags=re.I)
-    
-    # 7. Eliminar IDs, SKUs, referencias numéricas
-    s = re.sub(r"\b(?:ID|SKU|REF|ITEM|CODE|COD|ART)[-:\s#]*[A-Za-z0-9_-]*\b", "", s, flags=re.I)
+
+    # 7. Eliminar IDs, SKUs, UPCs, códigos de barras y referencias numéricas
+    s = re.sub(r"\b(?:ID|SKU|UPC|REF|ITEM|CODE|COD|ART)[-:\s#]*[A-Za-z0-9_-]*\b", "", s, flags=re.I)
     s = re.sub(r"#\s*\d+\b", "", s)
     s = re.sub(r"\b\d{6,}\b", "", s)
-    
-    # 8. Eliminar cualquier otro paréntesis residual
-    s = re.sub(r"\([^)]*\)", "", s)
-    
-    # 9. Limpiar símbolos y signos al inicio y al final
-    s = re.sub(r"^[-+*•±/\\–—\s\"'`.:;|,]+", "", s)
-    s = re.sub(r"[-+*•±/\\–—\s\"'`.:;|,]+$", "", s)
+
+    # 8. Eliminar cualquier otro paréntesis residual vacío o con números
+    s = re.sub(r"\(\s*\)", "", s)
+
+    # 9. Limpiar símbolos y signos al inicio y al final (preservando puntos o símbolos internos como 'HYDRA . SILK')
+    s = re.sub(r"^[+-/*•±\\–—\s\"'`.:;|,]+", "", s)
+    s = re.sub(r"[+-/*•±\\–—\s\"'`.:;|,]+$", "", s)
     s = re.sub(r"\s+", " ", s).strip()
-    
-    # 10. Descartar si es solo una palabra clave genérica o demasiado corta
-    palabras_invalidas = {
-        "return", "refund", "returns", "refunds", "devolucion", "devolución",
-        "void", "cancel", "cambio", "exchange", "item", "items", "producto",
-        "productos", "total", "subtotal", "tax", "date", "customer", "signature",
-        "visa", "mastercard", "amex", "cash", "credit", "debit", "sale", "invoice"
-    }
-    if len(s) < 3 or s.lower() in palabras_invalidas:
+
+    # 10. Descarte final si coincide con palabras inválidas, es demasiado corta o no tiene letras
+    if len(s) < 3 or s.lower() in PALABRAS_INVALIDAS_DEVOLUCION or not re.search(r"[a-zA-Z]", s):
         return ""
-        
+
+    # 11. Descarte si lo que queda activa el regex de exclusión
+    if REGEX_EXCLUDE_DISCARD_LINE.search(s):
+        return ""
+
     return s
 
 
@@ -1065,14 +1121,17 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
 
                 clasif = clasificar_archivo_nomenclatura(fname, ftext)
                 es_retorno = clasif.get("isReturnDocument", False) or f.get("classifiedType") == "return" or bool(REGEX_RETURN.search(fname)) or fname.lower().endswith("_r.jpg") or fname.lower().endswith("-r.jpg")
+                es_vip = clasif.get("categoria") == "VIP_FORM (_V / VIP)" or "vip" in fname.lower() or bool(REGEX_VIP.search(fname))
                 if es_retorno:
                     tiene_archivo_retorno = True
 
                 # Detección exhaustiva de productos devueltos / negativos sobre el texto OCR completo
-                prods_extraidos = extraer_productos_negativos_o_devolucion_de_texto(ftext, es_documento_retorno=es_retorno)
-                for p_ext in prods_extraidos:
-                    if p_ext and len(p_ext) >= 3:
-                        raw_negative_products.append(p_ext)
+                # NOTA CRÍTICA: Se omiten estrictamente archivos como _V.jpg y VIP.jpg para la Columna M de MASTER SHIPPINGS
+                if not es_vip:
+                    prods_extraidos = extraer_productos_negativos_o_devolucion_de_texto(ftext, es_documento_retorno=es_retorno)
+                    for p_ext in prods_extraidos:
+                        if p_ext and len(p_ext) >= 3:
+                            raw_negative_products.append(p_ext)
 
                 file_info = {
                     "nombre": fname,
@@ -1353,7 +1412,23 @@ Incluye SOLO los campos que el usuario quiere modificar.
       * Si hay múltiples facturas en pantalla/ShareFile para un cliente (relación N:1), las toma todas en cuenta de inmediato.
       * Cuál es exactamente la factura con devolución (`_R.jpg` o productos en negativo) y la aísla para MASTER SHIPPINGS.
       * La lista de productos sanitizados devueltos (limpios de signos, cantidades e IDs).
-    - Angy responde directamente confirmando los hallazgos y proponiendo o ejecutando la acción precisa sin fricción para el usuario.""",
+    - Angy responde directamente confirmando los hallazgos y proponiendo o ejecutando la acción precisa sin fricción para el usuario.
+
+13. REGLAS DE SANITIZACIÓN DE PRODUCTOS PARA MASTER SHIPPINGS (COLUMNA M):
+    - El objetivo primordial es extraer ÚNICAMENTE los nombres puros y limpios de los productos, eliminando cualquier ruido o dato irrelevante de OCR.
+    - Criterios de EXCLUSIÓN obligatorios (lo que se debe quitar):
+      1. Signos Aritméticos y Simbolismos Monetarios: +, -, (, ), $, %, $XX.XX, -1, x2, 3pcs, 50% OFF, etc.
+      2. Identificadores y Códigos: IDs de producto, SKUs, códigos de barras (ID-XXXX, #123, SKU-Y, UPC: ZZZ, números de 6+ dígitos).
+      3. Información de Contacto y Datos Personales: PHONE:, teléfonos (609-707-4463), EMAIL: (LBRosenson@aol.com), direcciones postales, ciudades, estados, códigos postales, países, datos de licencias e identificación (DOB, EXP, GENDER, HGT, EYES, DL R6696, CLASS D, ENDORSEMENTS, RESTRICTIONS, MVC, Chief Administrator).
+      4. Términos y Condiciones, Descargos de Responsabilidad y Legalidades: "All sales are final", "By signing the above I acknowledge that...", "Exchanges for unopened products...", "Reconozco la posibilidad de diferencias en el monto final...", políticas de venta o garantías.
+      5. Información de Envío y Logística: Métodos de envío (Ground Free, Business Days Express Delivery, Standard Shipping), fechas de envío (SHIP DATE).
+      6. Información de Transacción y Pagos: Tipos de cambio (Exchange Rate), TRANSACCION EN DOLARES, AFILIACION, terminales de punto de venta (Terminal: VS I@, BBVA).
+      7. Palabras Genéricas o Ruido de OCR: PHONE, EMAIL, Rev, US Toll Free#, Please Sign & Confirm, Commerce, C-O-M-E-R-C-I-O, SSA4, BBVA, RNQJ6AZMEM, NJCN6M01, Visit us at, nombres de entidades o compañías ("Empire SSA4", "Morena Mia Beauty Group S. de RL. de C.V.").
+    - Criterios de INCLUSIÓN (lo que se debe mantener como producto):
+      * Nombres de productos claros e inequívocos (ej. "HYDRA . SILK", "ACTIVING ELIXIR", "ATOMIC HEATING MASK", "D.TOX Peeling", "C.TOX Moisturizer", "C.TOX Night Cream", "Do'r24K Milk Cleanser", "Do'r24K Hydrafresh Toner", "SOLOS", "A.TOX Syringe", etc.).
+    - OMISIÓN ESTRICTA DE ARCHIVOS VIP (_V.jpg, VIP.jpg) PARA PRODUCTOS:
+      * Los archivos VIP son la Fuente #1 de verdad para Email y Teléfono del cliente.
+      * NUNCA se extraen ni listan productos provenientes de archivos VIP para la Columna M de MASTER SHIPPINGS.""",
     tools=[
         obtener_sesion_activa_frontend,
         consultar_invoice_en_firestore,
