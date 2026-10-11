@@ -212,18 +212,61 @@ def consultar_productos_pendientes(invoice: str, buscar_compensaciones_o_regalos
     # CASO 1: SHIPPING == "SI" / "YES"
     if is_shipping_yes:
         master_prod = str(data.get("master_shippings_products") or "").strip()
-        cust_prods = str(data.get("productos") or "").strip()
-        prods_extraidos = master_prod or cust_prods or "Envío registrado"
+        
+        # 1. Si ya existen productos en la Columna M de MASTER SHIPPINGS, SOLO mencionar esos
+        if master_prod:
+            return {
+                "invoice": clean_inv,
+                "cliente": cliente_nombre,
+                "columna_m_shipping": "SI",
+                "tiene_productos_pendientes": True,
+                "estado": "PENDIENTES_DE_ENVIO",
+                "respuesta": f"Hay productos pendientes de envío registrados en MASTER SHIPPINGS: {master_prod}",
+                "productos_pendientes": master_prod,
+                "columna_m_master_shippings": master_prod,
+                "nota": "Se toman exclusiva y directamente de la Columna M de MASTER SHIPPINGS (prohibido mencionar los de Customer Information)."
+            }
 
+        # 2. Si no están aún en MASTER SHIPPINGS, buscar si el invoice (o invoices del cliente) contiene archivo de devolución / negativo (_R.jpg / '-')
+        invoices_a_revisar = [clean_inv]
+        try:
+            sesion = obtener_sesion_activa_frontend()
+            if sesion.get("hay_sesion_activa"):
+                for inv in (sesion.get("invoices_detectados") or []):
+                    if str(inv).strip() and str(inv).strip() not in invoices_a_revisar:
+                        invoices_a_revisar.append(str(inv).strip())
+        except Exception:
+            pass
+
+        analisis_dev = analizar_multiples_invoices_devolucion(invoices_a_revisar)
+        if analisis_dev.get("hay_devolucion") and analisis_dev.get("hay_productos_sanitizables"):
+            prods_dev = analisis_dev.get("productos_devueltos_sanitizados") or []
+            inv_dev = analisis_dev.get("invoice_con_devolucion") or clean_inv
+            prods_dev_str = ", ".join(prods_dev)
+            return {
+                "invoice": inv_dev,
+                "cliente": cliente_nombre,
+                "columna_m_shipping": "SI",
+                "tiene_productos_pendientes": True,
+                "estado": "PRODUCTOS_DEVOLUCION_PENDIENTES",
+                "respuesta": f"Hay productos de devolución/retorno con saldo negativo para enviar a MASTER SHIPPINGS en el invoice {inv_dev}: {prods_dev_str}",
+                "productos_pendientes": prods_dev_str,
+                "invoice_devolucion": inv_dev,
+                "columna_m_master_shippings": "Pendiente de registro",
+                "nota": "Se toman exclusivamente los productos en negativo/retorno del invoice de devolución (no los productos de Customer Information)."
+            }
+
+        # 3. Si no hay productos en MASTER SHIPPINGS ni archivo de retorno/negativo
         return {
             "invoice": clean_inv,
             "cliente": cliente_nombre,
             "columna_m_shipping": "SI",
-            "tiene_productos_pendientes": True,
-            "estado": "PENDIENTES_DE_ENVIO",
-            "respuesta": f"Hay productos pendientes de envío para este invoice: {prods_extraidos}",
-            "productos_pendientes": prods_extraidos,
-            "columna_m_master_shippings": master_prod or "Vacía"
+            "tiene_productos_pendientes": False,
+            "estado": "SIN_PRODUCTOS_EN_MASTER_SHIPPINGS",
+            "respuesta": "El invoice tiene SHIPPING: SI en Customer Information, pero actualmente no cuenta con productos registrados en la Columna M de MASTER SHIPPINGS ni se detectaron productos en negativo / devolución (_R.jpg).",
+            "productos_pendientes": "Ninguno en MASTER SHIPPINGS",
+            "columna_m_master_shippings": "Vacía",
+            "nota": "No se mencionan los productos de Customer Information - Shippings por regla estricta."
         }
 
     # CASO 2: SHIPPING == "NO"
@@ -1002,8 +1045,11 @@ Incluye SOLO los campos que el usuario quiere modificar.
    - REGLA LÓGICA DE RESPUESTA A PRODUCTOS PENDIENTES:
      * **Antes de mencionar cualquier producto**, verificarás la Columna M (`SHIPPING`) en la hoja `Customer Information - Shippings` para el invoice correspondiente (mediante `consultar_productos_pendientes(invoice)`).
      * **SI la Columna M (`SHIPPING`) dice "SI" o "YES"**:
-       -> Extraerás los productos de la **Columna M (`PRODUCTS`)** de **MASTER SHIPPINGS**.
-       -> Informarás que: **"Hay productos pendientes de envío"** y listarás esos productos.
+       -> Se enviarán a **MASTER SHIPPINGS** los archivos/datos que estén en el invoice de **"Devolución"** o **"returns"** o productos con un signo de menos **"-"** en su invoice, tomando ese número de invoice con saldo negativo para crear la fila nueva en MASTER SHIPPINGS.
+       -> **Al responder sobre productos pendientes**:
+          1. Si existen ya productos en la **Columna M de MASTER SHIPPINGS**, **SOLO mencionarás esos productos**.
+          2. Si no están aún en MASTER SHIPPINGS, **SOLO mencionarás los productos de este invoice en negativo o devolución (`_R.jpg` / `-`)**.
+          3. **ESTÁ ESTRICTAMENTE PROHIBIDO mencionar los productos de la hoja Customer Information - Shippings**.
      * **SI la Columna M (`SHIPPING`) dice "NO"**:
        -> **NUNCA mencionarás esos productos como "productos para enviar"**.
        -> Tu respuesta inicial será: **"No hay productos pendientes de envío para este invoice."**
@@ -1025,7 +1071,8 @@ Incluye SOLO los campos que el usuario quiere modificar.
 10. RELACIÓN N:1 (VARIAS FACTURAS A UN CLIENTE) Y REGLA DE DEVOLUCIONES A MASTER SHIPPINGS:
     - En situaciones donde dos, tres o más números de factura (invoices) pertenecen a la **misma persona / cliente** (relación N:1 donde "1" es el cliente):
       * **NUNCA envíes todas las facturas a MASTER SHIPPINGS**.
-      * **SOLO se envía a MASTER SHIPPINGS la factura que contiene el archivo de devolución (`_R.jpg`, `R.jpg`, `RETURN.jpg`, `_r.jpg`) o productos/cantidades en negativo**.
+      * **SOLO se envía a MASTER SHIPPINGS la factura que contiene el archivo de devolución (`_R.jpg`, `R.jpg`, `RETURN.jpg`, `_r.jpg`) o productos/cantidades con signo menos `-`**.
+      * Se debe tomar **específicamente ese número de invoice con saldo negativo** para crear la fila nueva en **MASTER SHIPPINGS** (antes del banner `DEFECTIVE DEVICES...`).
       * Las facturas estándar de compra (sin devolución) se registran únicamente en **Customer Information - Shippings**.
       * **Casos límite (múltiples invoices en la carpeta)**: Si el usuario o el sistema proveen 2 números pero en la carpeta existen 3 o más, Angy y la app deben inspeccionar los archivos e identificar con precisión cuál es el número de invoice con la devolución negativa.
       * **Sanitización estricta de productos en Columna M de MASTER SHIPPINGS**: Todos los productos devueltos deben limpiarse completamente sin signos aritméticos (`-`, `+`, `(-1)`, `-$`), sin cantidades ni IDs/SKUs/códigos de barras (`ID-XXXX`, `#123`). Únicamente nombres puros y limpios del producto.
