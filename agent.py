@@ -1209,6 +1209,22 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
             "archivos": archivos_detectados
         })
 
+    # REGLA PRIORITARIA ABSOLUTA DEL INVOICE DE DEVOLUCIÓN:
+    # Si algún archivo de devolución contiene en su nombre un número de invoice específico (ej. "233145_R.jpg" -> "233145"),
+    # ESE es el invoice que tiene prioridad absoluta para MASTER SHIPPINGS, aunque no haya sido proporcionado inicialmente.
+    for af in todos_los_archivos_carpeta:
+        if af.get("es_devolucion"):
+            matches = re.findall(r"(?:^|[_\s-])(\d{5,8})(?:[_\s.-]|$)", af.get("nombre", ""))
+            if matches:
+                invoice_ret_nom = matches[0]
+                invoice_devolucion_seleccionada = invoice_ret_nom
+                # Si ese invoice ya tenía productos sanitizados, usarlos; de lo contrario mantener los productos negativos encontrados
+                for r in resultados_invoices:
+                    if r["invoice"] == invoice_ret_nom and r.get("productos_negativos_detectados_sanitizados"):
+                        productos_devueltos_sanitizados = r["productos_negativos_detectados_sanitizados"]
+                        break
+                break
+
     # Si se detectó un invoice de retorno entre los archivos pero no coincidía con el invoice iterado
     if not invoice_devolucion_seleccionada:
         for r in resultados_invoices:
@@ -1217,14 +1233,10 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
                 productos_devueltos_sanitizados = r["productos_negativos_detectados_sanitizados"]
                 break
 
-    # Si aún no se seleccionó, buscar si algún archivo de retorno contenía un invoice específico en su nombre
-    if not invoice_devolucion_seleccionada:
-        for af in todos_los_archivos_carpeta:
-            if af.get("es_devolucion"):
-                matches = re.findall(r"(?:^|[_\s-])(\d{5,8})(?:[_\s.-]|$)", af.get("nombre", ""))
-                if matches:
-                    invoice_devolucion_seleccionada = matches[0]
-                    break
+    # Actualizar marcas de debe_ir_a_master_shippings para reflejar el ganador absoluto
+    if invoice_devolucion_seleccionada:
+        for r in resultados_invoices:
+            r["debe_ir_a_master_shippings"] = (r["invoice"] == invoice_devolucion_seleccionada)
 
     hay_devolucion = bool(invoice_devolucion_seleccionada)
     hay_productos_sanitizables = len(productos_devueltos_sanitizados) > 0
@@ -1317,9 +1329,15 @@ def consultar_invoice_en_firestore(invoice: str) -> dict:
 root_agent = Agent(
     model='gemini-2.5-flash',
     name='root_agent',
-    description='Asistente experto Angy para Shipping Autofill, MASTER SHIPPINGS y redacción de correos.',
-    instruction="""Eres Angy, el agente experto e imbricado en el pipeline de Shipping Autofill y MASTER SHIPPINGS.
+    description='Asistente experta Angy para Shipping Autofill, MASTER SHIPPINGS y redacción de correos.',
+    instruction="""Eres Angy, la agente experta e imbricada en el pipeline de Shipping Autofill y MASTER SHIPPINGS.
 Hablas el mismo idioma técnico que la aplicación y dominas las reglas de nomenclatura Regex, los 3 momentos de telemetría de escaneo y la autorización perpetua con ShareFile.
+
+IDENTIDAD, GÉNERO Y PERSONAS CLAVE:
+- En todas tus respuestas debes formularlas refiriéndote a ti misma como "ella", utilizando pronombres y concordancia femenina en general ("ella", "la asistente", "experta", "creada", "programada", "lista", "atenta", etc.).
+- Si se te pregunta si conoces a Donna o a Erika, responderás con total claridad que SÍ:
+  * **Donna**: Es tu programadora y creadora, quien te dio vida y diseño.
+  * **Erika**: Es la Gerenta General o General Manager de la empresa.
 
 Sigue estrictamente estas reglas al responder preguntas, procesar archivos o utilizar tus herramientas:
 
@@ -1397,7 +1415,7 @@ Incluye SOLO los campos que el usuario quiere modificar.
         - **Archivos de Devolución (`_R.jpg`, `RETURN.jpg`, `-`)**: Extracción de productos devueltos sanitizados (sin signos +, -, $, cantidades ni SKUs/IDs).
         - **Archivos de Envío (`Shipping.jpg`, `shipping form.jpg`)**: Validación para habilitar el guardado/envío a MASTER SHIPPINGS.
         - **Archivos de Identificación (`_id.jpg`, `license`, `passport`) y Documentos Nuevos**: Cotejo ortográfico de nombres manuscritos, firmas, direcciones y detalles adicionales.
-      * Se debe tomar **específicamente ese número de invoice con saldo negativo** para crear la fila nueva en **MASTER SHIPPINGS** (antes del banner `DEFECTIVE DEVICES...`).
+      * Se debe tomar **específicamente ese número de invoice con saldo negativo** para crear la fila nueva en **MASTER SHIPPINGS** (antes del banner `DEFECTIVE DEVICES...`). Si el archivo de devolución o ticket con saldos negativos contiene un número de factura específico en su nombre (ej. `233145_R.jpg` -> `233145`), **ESE número de invoice tiene PRIORIDAD ABSOLUTA** para ser enviado a MASTER SHIPPINGS, aun si no fue proporcionado originalmente por el usuario.
       * Las facturas estándar de compra (sin devolución) se registran únicamente en **Customer Information - Shippings**.
       * **Sanitización estricta de productos en Columna M de MASTER SHIPPINGS**: Todos los productos devueltos deben limpiarse completamente sin signos aritméticos (`-`, `+`, `(-1)`, `-$`), sin cantidades ni IDs/SKUs/códigos de barras (`ID-XXXX`, `#123`). Únicamente nombres puros y limpios del producto.
       * Utiliza `analizar_multiples_invoices_devolucion` para inspeccionar y clasificar automáticamente el lote de facturas de un cliente y todos los archivos de la carpeta ganadora.
