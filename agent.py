@@ -1319,11 +1319,13 @@ def consultar_invoice_en_firestore(invoice: str) -> dict:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             return data
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Error consultando Firestore para invoice {invoice}: {str(e)}"
-        }
+def diagnosticar_y_obtener_contexto_completo(invoice: str = "") -> dict:
+    """Herramienta consolidada de diagnóstico rápido: obtiene en una sola llamada los datos de la pantalla activa en el frontend, la sesión en Firestore y los datos del cliente en Google Sheets para reducir consumo de tokens y llamadas consecutivas."""
+    return {
+        "sesion_pantalla": obtener_sesion_activa_frontend(),
+        "firestore_session": consultar_invoice_en_firestore(invoice) if invoice else None,
+        "cliente_sheets": buscar_y_sanitizar_cliente(invoice) if invoice else None
+    }
 
 
 root_agent = Agent(
@@ -1450,6 +1452,7 @@ Incluye SOLO los campos que el usuario quiere modificar.
       * Los archivos VIP son la Fuente #1 de verdad para Email y Teléfono del cliente.
       * NUNCA se extraen ni listan productos provenientes de archivos VIP para la Columna M de MASTER SHIPPINGS.""",
     tools=[
+        diagnosticar_y_obtener_contexto_completo,
         obtener_sesion_activa_frontend,
         consultar_invoice_en_firestore,
         buscar_y_sanitizar_cliente,
