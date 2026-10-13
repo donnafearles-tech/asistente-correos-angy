@@ -364,6 +364,36 @@ def buscar_y_sanitizar_cliente(invoice: str) -> dict:
     except Exception as e:
         return {"error": f"Error de conexión con el backend: {str(e)}"}
 
+def consultar_envios_y_motivos(invoice: str) -> dict:
+    """
+    Consulta todas las filas ("Envíos") asociadas a un mismo número de invoice en Google Sheets
+    (tanto en Customer Information - Shippings como en MASTER SHIPPINGS en todas las pestañas de años 2022-2026).
+    
+    Permite responder preguntas como:
+    - ¿Cuántos envíos tiene este número de invoice?
+    - ¿Cuál es el motivo de este envío / de cada envío?
+    
+    Retorna:
+    - total_envios: Número total de filas/registros de envío encontrados para este invoice.
+    - envios: Lista con el detalle de cada envío (hoja de cálculo, pestaña/año, fila, fecha, tienda, productos, notas y motivo).
+    - resumen: Un texto descriptivo listo para presentar al usuario.
+    """
+    clean_inv = str(invoice or "").strip()
+    if not clean_inv:
+        return {"error": "Debe proporcionar un número de invoice válido."}
+
+    try:
+        url = f"{BACKEND_URL}/api/sheets/envios-by-invoice?invoice={urllib.parse.quote(clean_inv)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Angy-Agent"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            return data
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Error de conexión consultando envíos para invoice {clean_inv}: {str(e)}"
+        }
+
 def consultar_productos_pendientes(invoice: str, buscar_compensaciones_o_regalos: bool = False) -> dict:
     """
     Consulta si un cliente tiene productos o envíos pendientes por recibir siguiendo el protocolo estricto:
@@ -1457,12 +1487,22 @@ Incluye SOLO los campos que el usuario quiere modificar.
       * Nombres de productos claros e inequívocos (ej. "HYDRA . SILK", "ACTIVING ELIXIR", "ATOMIC HEATING MASK", "D.TOX Peeling", "C.TOX Moisturizer", "C.TOX Night Cream", "Do'r24K Milk Cleanser", "Do'r24K Hydrafresh Toner", "SOLOS", "A.TOX Syringe", etc.).
     - OMISIÓN ESTRICTA DE ARCHIVOS VIP (_V.jpg, VIP.jpg) PARA PRODUCTOS:
       * Los archivos VIP son la Fuente #1 de verdad para Email y Teléfono del cliente.
-      * NUNCA se extraen ni listan productos provenientes de archivos VIP para la Columna M de MASTER SHIPPINGS.""",
+      * NUNCA se extraen ni listan productos provenientes de archivos VIP para la Columna M de MASTER SHIPPINGS.
+
+14. CONCEPTOS Y CONSULTA DE "ENVÍOS" (MÚLTIPLES FILAS PARA UN MISMO INVOICE):
+    - **Definición de "Envío"**: Cada fila en Google Sheets (sea en Customer Information - Shippings o en MASTER SHIPPINGS) donde aparezca registrado un número de invoice representa un **"Envío"** (despacho, registro o movimiento individual).
+    - **Diferencia entre Regla N:1 y Envíos**:
+      * Regla N:1 = Múltiples facturas DIFERENTES pertenecientes al MISMO cliente.
+      * Múltiples Envíos = El MISMO número de invoice presente en VARIAS filas de una o varias hojas.
+    - **Consulta de Envíos**:
+      * Cuando el usuario pregunte cuántos envíos tiene un invoice o cuál es el motivo de sus envíos (ej. "¿Cuántos envíos tiene este invoice y cuál es el motivo?"), utiliza SIEMPRE `consultar_envios_y_motivos(invoice)`.
+      * Reporta con claridad el número total de envíos (`total_envios`), desglosando cada uno con su número de envío, hoja/pestaña, número de fila, fecha y su **motivo** (extraído de las notas, comentarios o productos asociados a esa fila específica).""",
     tools=[
         diagnosticar_y_obtener_contexto_completo,
         obtener_sesion_activa_frontend,
         consultar_invoice_en_firestore,
         buscar_y_sanitizar_cliente,
+        consultar_envios_y_motivos,
         consultar_productos_pendientes,
         analizar_multiples_invoices_devolucion,
         procesar_caso_zendesk,
