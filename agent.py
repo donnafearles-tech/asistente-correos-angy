@@ -285,8 +285,10 @@ def clasificar_archivo_nomenclatura(file_name: str, text: str = "", is_letter_si
 def buscar_y_sanitizar_cliente(invoice: str) -> dict:
     """
     Busca los datos de un cliente en Google Sheets (tanto en Customer Information como en MASTER SHIPPINGS
-    en todas las pestañas 2023, 2024, 2025, 2026) por su número de invoice, limpia y sanitiza la información
-    y bloquea estrictamente los teléfonos y correos corporativos (ej. 8882494189).
+    en todas las pestañas 2023, 2024, 2025, 2026) por su número de invoice, lee toda la fila con sus coordenadas
+    de celda (Columna A..Z + Número de fila), clasifica semánticamente qué celdas corresponden a
+    'Datos de contacto del cliente' y cuáles a 'Dirección del cliente', y bloquea estrictamente los teléfonos
+    y correos corporativos (ej. 8882494189).
     """
     clean_inv = str(invoice or "").strip()
     url = f"{BACKEND_URL}/api/sheets/record-by-invoice?invoice={clean_inv}"
@@ -331,19 +333,35 @@ def buscar_y_sanitizar_cliente(invoice: str) -> dict:
             email_status = "Válido"
             display_email = raw_email
 
+        address_street = record.get("address") or record.get("masterAddress") or ""
+        city_val = record.get("city") or record.get("masterCity") or ""
+        state_val = record.get("region") or record.get("masterState") or ""
+        zip_val = record.get("zipCode") or record.get("masterZip") or ""
+        country_val = record.get("country") or record.get("masterCountry") or ""
+        full_address = ", ".join([p for p in [address_street, city_val, state_val, zip_val, country_val] if p])
+
+        full_name = record.get("customerName") or " ".join(
+            [p for p in [record.get("name") or "", record.get("lastName") or ""] if p]
+        )
+
         return {
             "invoice": record.get("invoice") or clean_inv,
             "year_tab": record.get("year") or "",
+            "fila_customer_information": record.get("rowIndex"),
+            "fila_master_shippings": record.get("masterRowIndex") if record.get("foundInMaster") else None,
+            "pestaña_master_shippings": record.get("masterSheetName") if record.get("foundInMaster") else None,
+            "nombre_completo": full_name,
             "nombre": record.get("name") or "",
             "apellido": record.get("lastName") or "",
             "tienda": record.get("storeName") or "",
             "fecha_venta": record.get("fecha") or "",
-            "vendedor_sales_rep": record.get("salesRep") or "",
-            "direccion_address_1": record.get("address") or "",
-            "ciudad_city": record.get("city") or "",
-            "region_state": record.get("region") or "",
-            "codigo_postal_zip": record.get("zipCode") or "",
-            "pais_country": record.get("country") or "",
+            "vendedor_sales_rep": record.get("salesRep") or record.get("masterSalesRep") or "",
+            "direccion_address_1": address_street,
+            "ciudad_city": city_val,
+            "region_state": state_val,
+            "codigo_postal_zip": zip_val,
+            "pais_country": country_val,
+            "direccion_completa": full_address,
             "productos": record.get("products") or "",
             "telefono_original": raw_phone,
             "telefono_sanitizado": display_phone,
@@ -353,16 +371,92 @@ def buscar_y_sanitizar_cliente(invoice: str) -> dict:
             "email_estado": email_status,
             "shipping": record.get("shipping") or "",
             "notas": record.get("csComment") or "",
+            # Bloques semánticos explícitos para distinguir Contacto vs Dirección con coordenadas de celda
+            "datos_de_contacto_del_cliente": {
+                "descripcion": "Datos de contacto e identidad directa del cliente (Nombre, Apellido, Teléfono, Email)",
+                "nombre_completo": full_name,
+                "nombre": record.get("name") or "",
+                "apellido": record.get("lastName") or "",
+                "telefono_sanitizado": display_phone,
+                "telefono_original": raw_phone,
+                "telefono_estado": phone_status,
+                "email_sanitizado": display_email,
+                "email_original": raw_email,
+                "email_estado": email_status,
+                "ubicacion_celdas": record.get("datosContactoCliente") or {},
+            },
+            "direccion_del_cliente": {
+                "descripcion": "Ubicación física / dirección postal de envío del cliente (Calle/Street, Ciudad, Estado, Código Postal, País)",
+                "calle_address_1": address_street,
+                "ciudad_city": city_val,
+                "estado_state": state_val,
+                "codigo_postal_zip": zip_val,
+                "pais_country": country_val,
+                "direccion_completa_formateada": full_address,
+                "ubicacion_celdas": record.get("direccionCliente") or {},
+            },
+            "lectura_filas_y_celdas": record.get("lecturaFilasYCeldas") or {},
             # Distinción de Hojas y Datos de MASTER SHIPPINGS
             "found_in_master": record.get("foundInMaster", False),
             "master_shippings_products": record.get("masterProducts") or "",
             "master_shippings_notes": record.get("masterNotes") or "",
+            "master_tracking": record.get("masterTracking") or "",
+            "master_shipped": record.get("masterShipped") or "",
+            "master_arrived": record.get("masterArrived") or "",
             "is_shipping_no": record.get("isShippingNo", False),
             "has_pending_products": record.get("hasPendingProducts", False),
             "pending_reason": record.get("pendingReason") or ""
         }
     except Exception as e:
         return {"error": f"Error de conexión con el backend: {str(e)}"}
+
+
+def leer_fila_y_celdas_sheets(
+    invoice: str = "",
+    fila: int = 0,
+    columna_o_celda: str = "",
+    hoja: str = "ambas",
+    anio: str = "2026"
+) -> dict:
+    """
+    Lee toda una fila completa de Google Sheets (en Customer Information - Shippings y/o MASTER SHIPPINGS)
+    y devuelve el desglose exacto celda por celda (Columna A hasta Z), indicando:
+    1. A qué columna (Letra A..Z y nombre del encabezado) y coordenada (ej. E45, F45) corresponde cada valor de la fila.
+    2. Qué celdas corresponden a 'DATOS DE CONTACTO DEL CLIENTE' (Nombre, Apellido, Teléfono, Email).
+    3. Qué celdas corresponden a 'DIRECCIÓN DEL CLIENTE' (Address 1 / Calle, City / Ciudad, State / Estado, Zip Code / Código Postal, Country / País).
+    4. Qué celdas corresponden a 'DATOS DE LA VENTA / FACTURA', 'PRODUCTOS Y ENVÍO' y 'SEGUIMIENTO Y LOGÍSTICA (TRACKING)'.
+
+    Parámetros:
+    - invoice: (Opcional) Número de factura para localizar automáticamente su fila en las hojas y leer todas sus celdas.
+    - fila: (Opcional) Número de fila exacta en Google Sheets (ej. 45) si el usuario pregunta por un número de fila específico.
+    - columna_o_celda: (Opcional) Letra de columna (ej. 'F', 'G', 'M') o coordenada de celda (ej. 'F45', 'H12') para enfocar una celda específica además de leer la fila completa.
+    - hoja: 'ambas' (por defecto), 'customer_information' o 'master_shippings'.
+    - anio: Pestaña del año ('2026' por defecto, '2025', '2024', '2023') cuando se busca por número de fila.
+    """
+    params = {}
+    if invoice and str(invoice).strip():
+        params["invoice"] = str(invoice).strip()
+    if fila and int(fila) > 0:
+        params["row"] = str(int(fila))
+    if columna_o_celda and str(columna_o_celda).strip():
+        params["cell"] = str(columna_o_celda).strip().upper()
+    if hoja and str(hoja).strip():
+        params["sheet"] = str(hoja).strip().lower()
+    if anio and str(anio).strip():
+        params["year"] = str(anio).strip()
+
+    try:
+        response = requests.get(f"{BACKEND_URL}/api/sheets/read-row-cells", params=params, timeout=20)
+        if response.status_code != 200:
+            try:
+                err_data = response.json()
+                return {"error": err_data.get("error") or f"Código HTTP {response.status_code}"}
+            except Exception:
+                return {"error": f"No se pudo leer la fila/celdas en el backend. Código: {response.status_code}"}
+        return response.json()
+    except Exception as e:
+        return {"error": f"Error de conexión al leer fila y celdas de Google Sheets: {str(e)}"}
+
 
 def consultar_envios_y_motivos(invoice: str) -> dict:
     """
@@ -1496,12 +1590,63 @@ Incluye SOLO los campos que el usuario quiere modificar.
       * Múltiples Envíos = El MISMO número de invoice presente en VARIAS filas de una o varias hojas.
     - **Consulta de Envíos**:
       * Cuando el usuario pregunte cuántos envíos tiene un invoice o cuál es el motivo de sus envíos (ej. "¿Cuántos envíos tiene este invoice y cuál es el motivo?"), utiliza SIEMPRE `consultar_envios_y_motivos(invoice)`.
-      * Reporta con claridad el número total de envíos (`total_envios`), desglosando cada uno con su número de envío, hoja/pestaña, número de fila, fecha y su **motivo** (extraído de las notas, comentarios o productos asociados a esa fila específica).""",
+      * Reporta con claridad el número total de envíos (`total_envios`), desglosando cada uno con su número de envío, hoja/pestaña, número de fila, fecha y su **motivo** (extraído de las notas, comentarios o productos asociados a esa fila específica).
+
+15. LECTURA EXHAUSTIVA DE FILAS, COLUMNAS Y CELDAS (Y DISTINCIÓN SEMÁNTICA ENTRE "DIRECCIÓN DEL CLIENTE" Y "DATOS DE CONTACTO DEL CLIENTE"):
+    - Cuando el usuario te pida leer una fila, consultar una celda/columna específica (ej. "lee toda la fila", "¿a qué columna corresponde esta fila/dato?", "¿qué hay en la celda F45?", "¿cuál es la dirección del cliente?" o "¿cuáles son los datos de contacto del cliente?"), utiliza `leer_fila_y_celdas_sheets` o `buscar_y_sanitizar_cliente`.
+    - Domina a la perfección el mapa exacto de columnas de cada hoja y su clasificación semántica:
+      * **HOJA 1: `Customer Information - Shippings` (Columnas A a P)**:
+        - **DATOS DE LA VENTA / FACTURA**:
+          * Columna **A** (`DATE`): Fecha de la venta.
+          * Columna **B** (`INVOICE`): Número de factura.
+          * Columna **C** (`TOTAL`): Monto total de la venta.
+          * Columna **D** (`STORE NAME`): Tienda donde se realizó la compra.
+        - **DATOS DE CONTACTO DEL CLIENTE** (Identidad y medios de comunicación directa con el cliente):
+          * Columna **E** (`NAME`): Nombre(s) del cliente.
+          * Columna **F** (`LAST NAME`): Apellido(s) del cliente.
+          * Columna **G** (`TELEPHONE`): Teléfono del cliente (sanitizado de 10 dígitos, bloqueando siempre el corporativo `8882494189`).
+          * Columna **H** (`EMAIL`): Correo electrónico del cliente.
+        - **DIRECCIÓN DEL CLIENTE** (Ubicación geográfica registrada en Hoja 1):
+          * Columna **I** (`STATE`): Estado / Región del cliente.
+          * Columna **J** (`ZIP CODE`): Código postal del cliente.
+          *(Nota: Hoja 1 solo guarda Estado y Código Postal; la calle, ciudad y país están en MASTER SHIPPINGS).*
+        - **PRODUCTOS Y ENVÍO**:
+          * Columna **K** (`PRODUCTS`): Productos comprados en la nota de venta.
+          * Columna **L** (`INSTRUCTIONS`): Instrucciones enviadas.
+          * Columna **M** (`SHIPPING`): Si requirió envío (`YES` / `NO`).
+          * Columna **N** (`SHIPPING DATE`): Fecha de envío.
+          * Columna **O** (`NOTES`): Notas o comentarios de Customer Service.
+          * Columna **P** (`CS CONTACT`): Contacto de Customer Service.
+      * **HOJA 2: `MASTER SHIPPINGS` (Columnas A a Z)**:
+        - **DATOS DE LA VENTA / FACTURA**:
+          * Columna **A** (`SALE DATE` / `Date`): Fecha de la venta.
+          * Columna **E** (`NOVA INVOICE`): Número de factura.
+          * Columna **K** (`Location - Store`): Tienda / Ubicación de venta.
+          * Columna **L** (`Sales rep`): Vendedor que atendió al cliente.
+        - **DATOS DE CONTACTO DEL CLIENTE** (Identidad y contacto directo en MASTER SHIPPINGS):
+          * Columna **B** (`Email`): Correo electrónico del cliente.
+          * Columna **C** (`Customer Full Name` / `CS Full Name`): Nombre completo del cliente.
+          * Columna **D** (`Phone #`): Teléfono del cliente.
+        - **DIRECCIÓN DEL CLIENTE** (Dirección postal completa de envío en MASTER SHIPPINGS):
+          * Columna **F** (`Address 1 (Street)`): Calle y número exterior/interior del domicilio del cliente.
+          * Columna **G** (`City`): Ciudad del domicilio del cliente.
+          * Columna **H** (`State`): Estado / Provincia del cliente.
+          * Columna **I** (`Zip Code`): Código postal del cliente.
+          * Columna **J** (`Country`): País del domicilio del cliente.
+        - **PRODUCTOS Y ENVÍO**:
+          * Columna **M** (`Products`): Productos pendientes de envío, devolución o compensación.
+          * Columna **N** (`Notes`): Notas del envío o motivo.
+        - **SEGUIMIENTO Y LOGÍSTICA (TRACKING)**:
+          * Columnas **O** (`TRACKING Received/Email sent`), **P** (`Handled`), **Q** (`Shipped`), **R** (`Tracking #`), **S** (`Arrived`), **T** (`Invoice`), **U** (`ZERO GRAVITY`), **V..Z** (Seguimiento Zero Gravity).
+    - **Al presentar la lectura de una fila o responder sobre Dirección vs Datos de Contacto**:
+      * Indica siempre el **número de fila** exacto y la **coordenada de celda** (ej. `F45 (Columna F - Address 1 (Street))`).
+      * Separa claramente qué valores pertenecen a **Datos de Contacto del Cliente** (Nombre, Apellido, Teléfono, Email) y cuáles pertenecen a la **Dirección del Cliente** (Calle/`Address 1`, Ciudad/`City`, Estado/`State`, Código Postal/`Zip Code`, País/`Country`), sin mezclarlos nunca.""",
     tools=[
         diagnosticar_y_obtener_contexto_completo,
         obtener_sesion_activa_frontend,
         consultar_invoice_en_firestore,
         buscar_y_sanitizar_cliente,
+        leer_fila_y_celdas_sheets,
         consultar_envios_y_motivos,
         consultar_productos_pendientes,
         analizar_multiples_invoices_devolucion,
