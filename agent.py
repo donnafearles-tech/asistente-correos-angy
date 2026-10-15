@@ -282,211 +282,1259 @@ def clasificar_archivo_nomenclatura(file_name: str, text: str = "", is_letter_si
     }
 
 
-def buscar_y_sanitizar_cliente(invoice: str) -> dict:
+# ==============================================================================
+# MOTOR UNIVERSAL DIRECTO DE GOOGLE SHEETS Y GOOGLE DRIVE (A:AZ + MULTI-HOJA)
+# ==============================================================================
+import time
+import base64
+
+CUSTOMER_INFO_SPREADSHEET_ID = os.environ.get(
+    "GOOGLE_SPREADSHEET_ID", "1-D0F025w23P9daLlLsfcGAbi9o_pnM1A_p70WtlZdK4"
+)
+MASTER_SHIPPINGS_SPREADSHEET_ID = os.environ.get(
+    "MASTER_SHIPPINGS_SPREADSHEET_ID", "1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY"
+)
+UP_SALES_SPREADSHEET_ID = os.environ.get(
+    "UP_SALES_SPREADSHEET_ID", "1HgzpKN0pwQqexkUqqjWhPsCaBC9VfvX-Dj8PqhOhA2s"
+)
+GCP_PROJECT_NUMBER = os.environ.get("GCP_PROJECT_NUMBER", "720693669884")
+
+_DIRECT_SA_CREDS = None
+_DIRECT_META_CACHE: dict[str, tuple[float, dict]] = {}
+_DIRECT_VALUES_CACHE: dict[str, tuple[float, list]] = {}
+_DIRECT_HEADER_CACHE: dict[str, list[str]] = {}
+
+
+def _index_to_col_letter(idx: int) -> str:
+    """Convierte índice 0-based (0 -> A, 25 -> Z, 26 -> AA, 39 -> AN) a letra de columna de Excel/Sheets."""
+    letter = ""
+    temp = idx
+    while temp >= 0:
+        letter = chr((temp % 26) + 65) + letter
+        temp = (temp // 26) - 1
+    return letter
+
+
+def _col_letter_to_index(col_str: str) -> int:
+    """Convierte letra de columna (A -> 0, Z -> 25, AA -> 26, AN -> 39) a índice 0-based."""
+    s = str(col_str or "").strip().upper()
+    result = 0
+    for ch in s:
+        if "A" <= ch <= "Z":
+            result = result * 26 + (ord(ch) - 64)
+    return result - 1
+
+
+def _get_direct_google_token() -> str | None:
     """
-    Busca los datos de un cliente en Google Sheets (tanto en Customer Information como en MASTER SHIPPINGS
-    en todas las pestañas 2023, 2024, 2025, 2026) por su número de invoice, lee toda la fila con sus coordenadas
-    de celda (Columna A..Z + Número de fila), clasifica semánticamente qué celdas corresponden a
-    'Datos de contacto del cliente' y cuáles a 'Dirección del cliente', y bloquea estrictamente los teléfonos
-    y correos corporativos (ej. 8882494189).
+    Obtiene un token OAuth2 para Google Sheets y Google Drive usando:
+    1. Variable de entorno GOOGLE_SERVICE_ACCOUNT_JSON
+    2. Archivo local service-account.json (../service-account.json o ./service-account.json)
+    3. GCP Secret Manager (projects/720693669884/secrets/GOOGLE_SERVICE_ACCOUNT_JSON/versions/latest:access)
+    4. Credenciales por defecto de Cloud Run (ADC) si tienen scopes suficientes
+    """
+    global _DIRECT_SA_CREDS
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    try:
+        from google.oauth2 import service_account
+        import google.auth
+        import google.auth.transport.requests
+
+        if _DIRECT_SA_CREDS is not None:
+            if not _DIRECT_SA_CREDS.valid or _DIRECT_SA_CREDS.expired:
+                _DIRECT_SA_CREDS.refresh(google.auth.transport.requests.Request())
+            return _DIRECT_SA_CREDS.token
+
+        sa_info = None
+        env_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+        if env_json:
+            try:
+                sa_info = json.loads(env_json)
+            except Exception:
+                pass
+
+        if not sa_info:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            candidate_paths = [
+                os.path.join(base_dir, "service-account.json"),
+                os.path.join(os.path.dirname(base_dir), "service-account.json"),
+                os.path.abspath("service-account.json"),
+            ]
+            for p in candidate_paths:
+                if os.path.isfile(p):
+                    try:
+                        with open(p, "r", encoding="utf-8") as f:
+                            sa_info = json.load(f)
+                        break
+                    except Exception:
+                        pass
+
+        if not sa_info:
+            # Intentar leer GOOGLE_SERVICE_ACCOUNT_JSON desde GCP Secret Manager usando ADC de Cloud Run
+            try:
+                adc_creds, _ = google.auth.default(
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                )
+                adc_creds.refresh(google.auth.transport.requests.Request())
+                sm_url = f"https://secretmanager.googleapis.com/v1/projects/{GCP_PROJECT_NUMBER}/secrets/GOOGLE_SERVICE_ACCOUNT_JSON/versions/latest:access"
+                sm_resp = requests.get(
+                    sm_url,
+                    headers={"Authorization": f"Bearer {adc_creds.token}"},
+                    timeout=10,
+                )
+                if sm_resp.status_code == 200:
+                    b64_payload = sm_resp.json().get("payload", {}).get("data", "")
+                    if b64_payload:
+                        raw_secret = base64.b64decode(b64_payload).decode("utf-8")
+                        sa_info = json.loads(raw_secret)
+            except Exception:
+                pass
+
+        if sa_info:
+            _DIRECT_SA_CREDS = service_account.Credentials.from_service_account_info(
+                sa_info, scopes=scopes
+            )
+            _DIRECT_SA_CREDS.refresh(google.auth.transport.requests.Request())
+            return _DIRECT_SA_CREDS.token
+
+        # Fallback a ADC directo
+        adc_creds, _ = google.auth.default(scopes=scopes)
+        adc_creds.refresh(google.auth.transport.requests.Request())
+        _DIRECT_SA_CREDS = adc_creds
+        return _DIRECT_SA_CREDS.token
+    except Exception:
+        return None
+
+
+def _parse_spreadsheet_input(
+    raw_input: str = "", explicit_gid: str = ""
+) -> dict:
+    """
+    Extrae spreadsheetId, gid y alias desde una URL completa de Google Sheets, un ID o un nombre corto.
+    Ejemplo: https://docs.google.com/spreadsheets/d/1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY/edit?gid=1576484704#gid=1576484704
+    """
+    s = str(raw_input or "").strip()
+    gid = str(explicit_gid or "").strip() or None
+    if not s:
+        return {"spreadsheetId": None, "gid": gid, "alias": "ambas"}
+
+    m_url = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
+    m_gid = re.search(r"[?#&]gid=(\d+)", s)
+    if m_gid and not gid:
+        gid = m_gid.group(1)
+
+    if m_url:
+        sp_id = m_url.group(1)
+        alias = "custom"
+        if sp_id == MASTER_SHIPPINGS_SPREADSHEET_ID:
+            alias = "master_shippings"
+        elif sp_id == CUSTOMER_INFO_SPREADSHEET_ID:
+            alias = "customer_information"
+        elif sp_id == UP_SALES_SPREADSHEET_ID:
+            alias = "up_sales"
+        return {"spreadsheetId": sp_id, "gid": gid, "alias": alias}
+
+    low = s.lower()
+    if low in ("master", "master_shippings", "master shippings"):
+        return {
+            "spreadsheetId": MASTER_SHIPPINGS_SPREADSHEET_ID,
+            "gid": gid,
+            "alias": "master_shippings",
+        }
+    if low in (
+        "customer",
+        "customer_information",
+        "customer_info",
+        "customer information",
+        "customer information - shippings",
+    ):
+        return {
+            "spreadsheetId": CUSTOMER_INFO_SPREADSHEET_ID,
+            "gid": gid,
+            "alias": "customer_information",
+        }
+    if low in ("upsales", "up_sales", "up sales", "up sales report", "daily report"):
+        return {
+            "spreadsheetId": UP_SALES_SPREADSHEET_ID,
+            "gid": gid,
+            "alias": "up_sales",
+        }
+    if low in ("ambas", "both", "todas", "all"):
+        return {"spreadsheetId": None, "gid": gid, "alias": low}
+
+    if re.match(r"^[a-zA-Z0-9-_]{25,60}$", s):
+        alias = "custom"
+        if s == MASTER_SHIPPINGS_SPREADSHEET_ID:
+            alias = "master_shippings"
+        elif s == CUSTOMER_INFO_SPREADSHEET_ID:
+            alias = "customer_information"
+        elif s == UP_SALES_SPREADSHEET_ID:
+            alias = "up_sales"
+        return {"spreadsheetId": s, "gid": gid, "alias": alias}
+
+    return {"spreadsheetId": None, "gid": gid, "alias": low}
+
+
+def _direct_get_spreadsheet_meta(spreadsheet_id: str) -> dict | None:
+    """Obtiene el título y las pestañas (title, sheetId/gid, rowCount, columnCount) de un Spreadsheet."""
+    now = time.time()
+    cached = _DIRECT_META_CACHE.get(spreadsheet_id)
+    if cached and (now - cached[0]) < 300:
+        return cached[1]
+
+    token = _get_direct_google_token()
+    if not token:
+        return None
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}?fields=properties.title,sheets.properties"
+    try:
+        resp = requests.get(
+            url, headers={"Authorization": f"Bearer {token}"}, timeout=15
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        meta = {
+            "spreadsheetId": spreadsheet_id,
+            "title": data.get("properties", {}).get("title", spreadsheet_id),
+            "sheets": [
+                {
+                    "title": sh.get("properties", {}).get("title", ""),
+                    "gid": sh.get("properties", {}).get("sheetId", 0),
+                    "rowCount": sh.get("properties", {})
+                    .get("gridProperties", {})
+                    .get("rowCount", 0),
+                    "columnCount": sh.get("properties", {})
+                    .get("gridProperties", {})
+                    .get("columnCount", 0),
+                }
+                for sh in data.get("sheets", [])
+            ],
+        }
+        _DIRECT_META_CACHE[spreadsheet_id] = (now, meta)
+        return meta
+    except Exception:
+        return None
+
+
+def _direct_get_sheet_values(
+    spreadsheet_id: str, range_str: str, ttl_seconds: int = 45
+) -> list[list[str]] | None:
+    """Lee un rango de valores (ej. '2026!A:AZ') desde Google Sheets API v4 con caché ligero."""
+    cache_key = f"{spreadsheet_id}:{range_str}"
+    now = time.time()
+    cached = _DIRECT_VALUES_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < ttl_seconds:
+        return cached[1]
+
+    token = _get_direct_google_token()
+    if not token:
+        return None
+    encoded_range = urllib.parse.quote(range_str)
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{encoded_range}"
+    try:
+        resp = requests.get(
+            url, headers={"Authorization": f"Bearer {token}"}, timeout=20
+        )
+        if resp.status_code != 200:
+            return None
+        rows = resp.json().get("values", [])
+        _DIRECT_VALUES_CACHE[cache_key] = (now, rows)
+        return rows
+    except Exception:
+        return None
+
+
+def _direct_get_sheet_headers(spreadsheet_id: str, sheet_name: str) -> list[str]:
+    """Obtiene los encabezados reales de una pestaña (detectando automáticamente si la Fila 1 es un banner como en UP SALES REPORT y los encabezados están en la Fila 2)."""
+    cache_key = f"{spreadsheet_id}:{sheet_name}"
+    if cache_key in _DIRECT_HEADER_CACHE:
+        return _DIRECT_HEADER_CACHE[cache_key]
+
+    rows = _direct_get_sheet_values(spreadsheet_id, f"'{sheet_name}'!A1:AZ2", ttl_seconds=300)
+    if not rows:
+        return []
+    row1 = [str(c or "").strip() for c in (rows[0] if len(rows) > 0 else [])]
+    row2 = [str(c or "").strip() for c in (rows[1] if len(rows) > 1 else [])]
+    non_empty_1 = len([c for c in row1 if c])
+    non_empty_2 = len([c for c in row2 if c])
+    chosen = row2 if (non_empty_1 <= 2 and non_empty_2 >= 3) else row1
+    _DIRECT_HEADER_CACHE[cache_key] = chosen
+    return chosen
+
+
+def _direct_build_row_cell_breakdown(
+    sheet_type: str,
+    sheet_tab: str,
+    row_number: int,
+    row_values: list,
+    raw_headers: list[str] | None = None,
+    requested_col_or_cell: str = "",
+) -> dict:
+    """
+    Construye el desglose celda por celda desde la Columna A hasta AZ (incluyendo los 4 bloques de proveedores
+    de Tracking en MASTER SHIPPINGS: ZERO GRAVITY, Empire Tech, STEMTOX / INTERNAL y SPACETOUCH).
+    """
+    master_fallback_headers = [
+        "SALE DATE", "Email", "Customer Full Name", "Phone #", "NOVA INVOICE",
+        "Address 1 (Street)", "City", "State", "Zip Code", "Country",
+        "Location - Store", "Sales rep", "Products", "Notes", "TRACKING Received/Email sent",
+        "Handled (ZERO GRAVITY)", "Shipped (ZERO GRAVITY)", "Tracking # (ZERO GRAVITY)", "Arrived (ZERO GRAVITY)", "Invoice (ZERO GRAVITY)", "ZERO GRAVITY (Productos)",
+        "Handled (Empire Tech)", "Shipped (Empire Tech)", "Tracking # (Empire Tech)", "Arrived (Empire Tech)", "Invoice (Empire Tech)", "Empire Tech (Productos)",
+        "Handled (STEMTOX / INTERNAL)", "Shipped (STEMTOX / INTERNAL)", "Tracking # (STEMTOX / INTERNAL)", "Arrived (STEMTOX / INTERNAL)", "Invoice (STEMTOX / INTERNAL)", "STEMTOX / INTERNAL (Productos)",
+        "Handled (SPACETOUCH)", "Shipped (SPACETOUCH)", "Tracking # (SPACETOUCH)", "Arrived (SPACETOUCH)", "Invoice (SPACETOUCH)", "SPACETOUCH (Productos)",
+        "ESTADO",
+    ]
+    customer_fallback_headers = [
+        "DATE", "INVOICE", "TOTAL", "STORE NAME", "NAME", "LAST NAME",
+        "TELEPHONE", "EMAIL", "STATE", "ZIP CODE", "PRODUCTS", "INSTRUCTIONS",
+        "SHIPPING", "SHIPPING DATE", "NOTES", "CS CONTACT",
+    ]
+    upsales_fallback_headers = [
+        "INVOICE", "DATE", "TOTAL", "CUSTOMER NAME", "LOCATION", "CITY",
+        "SHAREFILE LINK", " NEW VALID EMAIL", "SENT TO VIP", "WRONG EMAIL OR SENT FAILED",
+        "EMAIL SENT BY:", " DATE SENT", "OPENED EMAIL", "STATUS", "Signature",
+        "Notes", "Sales Reps", "EMAIL",
+    ]
+
+    if sheet_type == "master_shippings":
+        fallback_headers = master_fallback_headers
+        spreadsheet_title = "MASTER SHIPPINGS (1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY)"
+    elif sheet_type == "customer_information":
+        fallback_headers = customer_fallback_headers
+        spreadsheet_title = "Customer Information - Shippings (1-D0F025w23P9daLlLsfcGAbi9o_pnM1A_p70WtlZdK4)"
+    elif sheet_type == "up_sales":
+        fallback_headers = upsales_fallback_headers
+        spreadsheet_title = "UP SALES REPORT (1HgzpKN0pwQqexkUqqjWhPsCaBC9VfvX-Dj8PqhOhA2s)"
+    else:
+        fallback_headers = raw_headers or []
+        spreadsheet_title = sheet_type
+
+    max_len = max(len(row_values or []), len(raw_headers or []), len(fallback_headers))
+    celdas_por_columna = {}
+    todas_las_celdas = []
+    datos_contacto = {}
+    direccion_cliente = {}
+
+    for idx in range(max_len):
+        col_letter = _index_to_col_letter(idx)
+        coord = f"{col_letter}{row_number}"
+        raw_h = (
+            str(raw_headers[idx]).strip()
+            if (raw_headers and idx < len(raw_headers) and str(raw_headers[idx]).strip())
+            else ""
+        )
+        header_name = raw_h or (fallback_headers[idx] if idx < len(fallback_headers) else f"Columna {col_letter}")
+
+        if sheet_type == "master_shippings":
+            if 15 <= idx <= 19:
+                header_name = f"{header_name} [Bloque 1: ZERO GRAVITY]"
+            elif idx == 20:
+                header_name = "ZERO GRAVITY (Productos Bloque 1)"
+            elif 21 <= idx <= 25:
+                header_name = f"{header_name} [Bloque 2: Empire Tech]"
+            elif idx == 26:
+                header_name = "Empire Tech (Productos Bloque 2)"
+            elif 27 <= idx <= 31:
+                header_name = f"{header_name} [Bloque 3: STEMTOX / INTERNAL]"
+            elif idx == 32:
+                header_name = "STEMTOX / INTERNAL (Productos Bloque 3)"
+            elif 33 <= idx <= 37:
+                header_name = f"{header_name} [Bloque 4: SPACETOUCH]"
+            elif idx == 38:
+                header_name = "SPACETOUCH (Productos Bloque 4)"
+
+        val = str(row_values[idx]).strip() if (row_values and idx < len(row_values) and row_values[idx] is not None) else ""
+        categoria_semantica = "OTROS_DATOS_FILA"
+        subcampo = header_name
+
+        if sheet_type == "customer_information":
+            if col_letter in ("E", "F", "G", "H"):
+                categoria_semantica = "DATOS_DE_CONTACTO_DEL_CLIENTE"
+                if col_letter == "E":
+                    subcampo = "Nombre del cliente (NAME)"
+                    datos_contacto["nombre"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+                elif col_letter == "F":
+                    subcampo = "Apellido del cliente (LAST NAME)"
+                    datos_contacto["apellido"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+                elif col_letter == "G":
+                    subcampo = "Teléfono del cliente (TELEPHONE)"
+                    datos_contacto["telefono"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+                elif col_letter == "H":
+                    subcampo = "Correo electrónico del cliente (EMAIL)"
+                    datos_contacto["email"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+            elif col_letter in ("I", "J"):
+                categoria_semantica = "DIRECCION_DEL_CLIENTE"
+                if col_letter == "I":
+                    subcampo = "Estado / Región (STATE)"
+                    direccion_cliente["estado_state"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+                elif col_letter == "J":
+                    subcampo = "Código Postal (ZIP CODE)"
+                    direccion_cliente["codigo_postal_zip"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+            elif col_letter in ("A", "B", "C", "D"):
+                categoria_semantica = "DATOS_DE_LA_VENTA_E_INVOICE"
+            elif col_letter in ("K", "L", "M", "N", "O", "P"):
+                categoria_semantica = "PRODUCTOS_Y_ENVIO"
+        elif sheet_type == "master_shippings":
+            if col_letter in ("B", "C", "D"):
+                categoria_semantica = "DATOS_DE_CONTACTO_DEL_CLIENTE"
+                if col_letter == "B":
+                    subcampo = "Correo electrónico del cliente (Email)"
+                    datos_contacto["email"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+                elif col_letter == "C":
+                    subcampo = "Nombre completo del cliente (Customer Full Name)"
+                    datos_contacto["nombre_completo"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+                elif col_letter == "D":
+                    subcampo = "Teléfono del cliente (Phone #)"
+                    datos_contacto["telefono"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+            elif col_letter in ("F", "G", "H", "I", "J"):
+                categoria_semantica = "DIRECCION_DEL_CLIENTE"
+                if col_letter == "F":
+                    subcampo = "Calle y número (Address 1 / Street)"
+                    direccion_cliente["calle_address_1"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+                elif col_letter == "G":
+                    subcampo = "Ciudad (City)"
+                    direccion_cliente["ciudad_city"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+                elif col_letter == "H":
+                    subcampo = "Estado / Provincia (State)"
+                    direccion_cliente["estado_state"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+                elif col_letter == "I":
+                    subcampo = "Código Postal (Zip Code)"
+                    direccion_cliente["codigo_postal_zip"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+                elif col_letter == "J":
+                    subcampo = "País (Country)"
+                    direccion_cliente["pais_country"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+            elif col_letter in ("A", "E", "K", "L"):
+                categoria_semantica = "DATOS_DE_LA_VENTA_E_INVOICE"
+            elif col_letter in ("M", "N"):
+                categoria_semantica = "PRODUCTOS_Y_MOTIVO_ENVIO"
+            elif idx >= 14:
+                categoria_semantica = "SEGUIMIENTO_Y_LOGISTICA_TRACKING"
+        else:
+            h_low = header_name.lower()
+            if any(w in h_low for w in ("email", "mail", "phone", "tel", "customer name", "full name", "client", "nombre")):
+                categoria_semantica = "DATOS_DE_CONTACTO_DEL_CLIENTE"
+                if "email" in h_low or "mail" in h_low:
+                    datos_contacto[f"email_{col_letter}"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+                elif "phone" in h_low or "tel" in h_low:
+                    datos_contacto[f"telefono_{col_letter}"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+                else:
+                    datos_contacto[f"nombre_{col_letter}"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+            elif any(w in h_low for w in ("address", "city", "state", "zip", "country", "calle", "ciudad")):
+                categoria_semantica = "DIRECCION_DEL_CLIENTE"
+                direccion_cliente[f"direccion_{col_letter}"] = {"celda": coord, "columna": col_letter, "encabezado": header_name, "valor": val}
+            elif any(w in h_low for w in ("invoice", "date", "total", "store", "location", "sales rep")):
+                categoria_semantica = "DATOS_DE_LA_VENTA_E_INVOICE"
+            elif any(w in h_low for w in ("tracking", "shipped", "arrived", "handled", "status", "estado")):
+                categoria_semantica = "SEGUIMIENTO_Y_LOGISTICA_TRACKING"
+
+        cell_info = {
+            "celda": coord,
+            "columna": col_letter,
+            "fila": row_number,
+            "encabezado": header_name,
+            "valor": val,
+            "categoriaSemantica": categoria_semantica,
+            "Significado": subcampo,
+        }
+        celdas_por_columna[col_letter] = cell_info
+        todas_las_celdas.append(cell_info)
+
+    seguimiento_logistica_tracking = None
+    if sheet_type == "master_shippings":
+        def _gv(i: int) -> str:
+            return str(row_values[i]).strip() if (row_values and i < len(row_values) and row_values[i] is not None) else ""
+
+        vendor_blocks = [
+            {
+                "proveedor": "ZERO GRAVITY",
+                "rangoColumnas": f"P{row_number}:U{row_number}",
+                "handled": {"celda": f"P{row_number}", "valor": _gv(15)},
+                "shipped": {"celda": f"Q{row_number}", "valor": _gv(16)},
+                "trackingNumber": {"celda": f"R{row_number}", "valor": _gv(17)},
+                "arrived": {"celda": f"S{row_number}", "valor": _gv(18)},
+                "vendorInvoice": {"celda": f"T{row_number}", "valor": _gv(19)},
+                "productos": {"celda": f"U{row_number}", "valor": _gv(20)},
+            },
+            {
+                "proveedor": "Empire Tech",
+                "rangoColumnas": f"V{row_number}:AA{row_number}",
+                "handled": {"celda": f"V{row_number}", "valor": _gv(21)},
+                "shipped": {"celda": f"W{row_number}", "valor": _gv(22)},
+                "trackingNumber": {"celda": f"X{row_number}", "valor": _gv(23)},
+                "arrived": {"celda": f"Y{row_number}", "valor": _gv(24)},
+                "vendorInvoice": {"celda": f"Z{row_number}", "valor": _gv(25)},
+                "productos": {"celda": f"AA{row_number}", "valor": _gv(26)},
+            },
+            {
+                "proveedor": "STEMTOX / INTERNAL",
+                "rangoColumnas": f"AB{row_number}:AG{row_number}",
+                "handled": {"celda": f"AB{row_number}", "valor": _gv(27)},
+                "shipped": {"celda": f"AC{row_number}", "valor": _gv(28)},
+                "trackingNumber": {"celda": f"AD{row_number}", "valor": _gv(29)},
+                "arrived": {"celda": f"AE{row_number}", "valor": _gv(30)},
+                "vendorInvoice": {"celda": f"AF{row_number}", "valor": _gv(31)},
+                "productos": {"celda": f"AG{row_number}", "valor": _gv(32)},
+            },
+            {
+                "proveedor": "SPACETOUCH",
+                "rangoColumnas": f"AH{row_number}:AM{row_number}",
+                "handled": {"celda": f"AH{row_number}", "valor": _gv(33)},
+                "shipped": {"celda": f"AI{row_number}", "valor": _gv(34)},
+                "trackingNumber": {"celda": f"AJ{row_number}", "valor": _gv(35)},
+                "arrived": {"celda": f"AK{row_number}", "valor": _gv(36)},
+                "vendorInvoice": {"celda": f"AL{row_number}", "valor": _gv(37)},
+                "productos": {"celda": f"AM{row_number}", "valor": _gv(38)},
+            },
+        ]
+
+        trackings_activos = []
+        for vb in vendor_blocks:
+            if (
+                vb["trackingNumber"]["valor"]
+                or vb["shipped"]["valor"]
+                or vb["arrived"]["valor"]
+                or vb["productos"]["valor"]
+            ):
+                trackings_activos.append(
+                    {
+                        "bloqueProveedor": vb["proveedor"],
+                        "rango": vb["rangoColumnas"],
+                        "celdaTracking": vb["trackingNumber"]["celda"],
+                        "trackingNumber": vb["trackingNumber"]["valor"] or "(Pendiente de guía / sin tracking)",
+                        "handled": vb["handled"]["valor"],
+                        "shipped": f"{vb['shipped']['valor']} ({vb['shipped']['celda']})" if vb["shipped"]["valor"] else "",
+                        "arrived": f"{vb['arrived']['valor']} ({vb['arrived']['celda']})" if vb["arrived"]["valor"] else "",
+                        "invoiceProveedor": f"{vb['vendorInvoice']['valor']} ({vb['vendorInvoice']['celda']})" if vb["vendorInvoice"]["valor"] else "",
+                        "productosProveedor": f"{vb['productos']['valor']} ({vb['productos']['celda']})" if vb["productos"]["valor"] else "",
+                    }
+                )
+
+        seguimiento_logistica_tracking = {
+            "trackingReceivedOrEmailSent": {"celda": f"O{row_number}", "valor": _gv(14)},
+            "estadoGeneral": {"celda": f"AN{row_number}", "valor": _gv(39)},
+            "tieneTrackingActivo": any(bool(vb["trackingNumber"]["valor"]) for vb in vendor_blocks),
+            "trackingsActivos": trackings_activos,
+            "bloquesProveedores": vendor_blocks,
+        }
+
+    celda_consultada = None
+    if requested_col_or_cell:
+        clean_req = str(requested_col_or_cell).strip().upper()
+        m_col = re.match(r"^([A-Z]{1,2})(\d+)?$", clean_req)
+        if m_col:
+            col_l = m_col.group(1)
+            if col_l in celdas_por_columna:
+                celda_consultada = celdas_por_columna[col_l]
+
+    if sheet_type == "customer_information":
+        nota_dir = "En Customer Information - Shippings solo se registran Estado (Columna I) y Código Postal (Columna J). La dirección postal completa está en MASTER SHIPPINGS (Columnas F a J)."
+    elif sheet_type == "master_shippings":
+        nota_dir = "En MASTER SHIPPINGS la dirección postal completa está en las columnas F (Address 1 / Calle), G (City), H (State), I (Zip Code) y J (Country)."
+    else:
+        nota_dir = "Columnas de ubicación detectadas automáticamente por encabezado."
+
+    return {
+        "hoja": spreadsheet_title,
+        "tipoHoja": sheet_type,
+        "pestaña": sheet_tab,
+        "fila": row_number,
+        "celdaConsultada": celda_consultada,
+        "datosContactoCliente": {
+            "descripcion": "Datos de contacto e identidad directa del cliente (Nombre, Apellido, Teléfono y Correo Electrónico)",
+            "campos": datos_contacto,
+        },
+        "direccionCliente": {
+            "descripcion": "Dirección física / postal de envío del cliente (Calle/Street, Ciudad, Estado, Código Postal, País)",
+            "nota": nota_dir,
+            "campos": direccion_cliente,
+        },
+        "seguimientoLogisticaTracking": seguimiento_logistica_tracking,
+        "celdasPorColumna": celdas_por_columna,
+        "todasLasCeldasDeLaFila": todas_las_celdas,
+    }
+
+
+def _direct_find_all_invoice_rows(
+    spreadsheet_id: str,
+    sheet_name: str,
+    clean_inv: str,
+    preferred_col_idx: int | None = None,
+) -> list[dict]:
+    """
+    Busca TODAS las filas en una pestaña donde aparezca el invoice (exacto o en celda multilínea como '224366\\n\\n224377').
+    """
+    rows = _direct_get_sheet_values(spreadsheet_id, f"'{sheet_name}'!A:AZ")
+    if not rows:
+        return []
+    matches = []
+    target_lower = clean_inv.strip().lower()
+    inv_regex = re.compile(
+        r"(?:^|[\s,;:/\n\r#-])" + re.escape(target_lower) + r"(?:$|[\s,;:/\n\r#-])",
+        re.I,
+    )
+
+    for i, row in enumerate(rows):
+        matched = False
+        if preferred_col_idx is not None and preferred_col_idx < len(row):
+            cell_val = str(row[preferred_col_idx] or "").strip().lower()
+            if cell_val == target_lower or inv_regex.search(cell_val):
+                matched = True
+        if not matched:
+            for c_idx in range(min(len(row), 12)):
+                cell_val = str(row[c_idx] or "").strip().lower()
+                if cell_val == target_lower or inv_regex.search(cell_val):
+                    matched = True
+                    break
+        if matched:
+            matches.append({"rowIndex": i + 1, "rowValues": row})
+    return matches
+
+
+def _direct_read_row_cells(
+    invoice: str = "",
+    fila: int = 0,
+    columna_o_celda: str = "",
+    hoja: str = "ambas",
+    anio: str = "2026",
+    spreadsheet_url_o_id: str = "",
+    gid: str = "",
+) -> dict:
+    """
+    Motor directo en Python para leer cualquier fila y sus celdas (A..AZ) por invoice, número de fila,
+    coordenada de celda o URL/ID de Google Sheets + gid.
     """
     clean_inv = str(invoice or "").strip()
-    url = f"{BACKEND_URL}/api/sheets/record-by-invoice?invoice={clean_inv}"
-    try:
-        response = requests.get(url, timeout=15)
-        if response.status_code != 200:
-            return {"error": f"No se pudo consultar el backend. Código: {response.status_code}"}
-        
-        data = response.json()
-        if not data.get("success") or not data.get("record"):
-            return {"error": f"No se encontró registro en Google Sheets para la factura {clean_inv}. Puedes usar 'escanear_y_rellenar_master_shippings' o 'obtener_textos_de_archivos' para buscarla directamente en ShareFile."}
-        
-        record = data["record"]
-        
-        # Sanitizar teléfono
-        raw_phone = str(record.get("phone") or "").strip()
-        clean_phone = "".join(filter(str.isdigit, raw_phone))
-        if len(clean_phone) > 10:
-            clean_phone = clean_phone[-10:]
-            
-        # Bloquear teléfono corporativo de la empresa
-        if clean_phone in COMPANY_PHONES:
-            phone_status = "BLOQUEADO (Es el número corporativo de la empresa)"
-            display_phone = ""
-        elif len(clean_phone) < 10:
-            phone_status = "Inválido (menos de 10 dígitos)"
-            display_phone = ""
-        else:
-            phone_status = "Válido"
-            display_phone = clean_phone
-            
-        # Sanitizar Email (Bloquear correos corporativos de soporte)
-        raw_email = str(record.get("email") or "").strip().lower()
-        is_corporate_email = any(word in raw_email for word in [
-            "customerservice", "noreply", "info@", "support@", "hello@", "contact@", "admin@", "sales@", "cs"
-        ])
-        
-        if is_corporate_email:
-            email_status = "BLOQUEADO (Correo corporativo de soporte)"
-            display_email = ""
-        else:
-            email_status = "Válido"
-            display_email = raw_email
+    req_row = int(fila) if (fila and int(fila) > 0) else 0
+    cell_param = str(columna_o_celda or "").strip().upper()
+    year_param = str(anio or "2026").strip()
+    raw_sheet_input = str(spreadsheet_url_o_id or hoja or "ambas").strip()
+    parsed = _parse_spreadsheet_input(raw_sheet_input, explicit_gid=gid)
 
-        address_street = record.get("address") or record.get("masterAddress") or ""
-        city_val = record.get("city") or record.get("masterCity") or ""
-        state_val = record.get("region") or record.get("masterState") or ""
-        zip_val = record.get("zipCode") or record.get("masterZip") or ""
-        country_val = record.get("country") or record.get("masterCountry") or ""
-        full_address = ", ".join([p for p in [address_street, city_val, state_val, zip_val, country_val] if p])
+    if not req_row and cell_param:
+        m_cell = re.match(r"^([A-Z]{1,2})(\d+)$", cell_param)
+        if m_cell:
+            req_row = int(m_cell.group(2))
 
-        full_name = record.get("customerName") or " ".join(
-            [p for p in [record.get("name") or "", record.get("lastName") or ""] if p]
+    if not clean_inv and req_row <= 0:
+        return {
+            "success": False,
+            "error": "Debes proporcionar un número de 'invoice', un número de 'fila' o una coordenada de 'celda' (ej. AD3975).",
+        }
+
+    resultados = {}
+
+    # Caso 1: Spreadsheet específico por URL o ID o alias único (ej. cuando el usuario pasa un link con #gid=...)
+    if parsed["spreadsheetId"]:
+        sp_id = parsed["spreadsheetId"]
+        sheet_type = parsed["alias"] if parsed["alias"] != "custom" else sp_id
+        meta = _direct_get_spreadsheet_meta(sp_id)
+        all_tabs = [s["title"] for s in (meta.get("sheets", []) if meta else [])]
+        if not all_tabs:
+            all_tabs = ["2026", "2025", "2024", "2023"]
+
+        gid_resolved_tab = None
+        if parsed["gid"] and meta:
+            for sh in meta.get("sheets", []):
+                if str(sh.get("gid")) == str(parsed["gid"]):
+                    gid_resolved_tab = sh.get("title")
+                    break
+
+        preferred_col = (
+            4 if sp_id == MASTER_SHIPPINGS_SPREADSHEET_ID else (1 if sp_id == CUSTOMER_INFO_SPREADSHEET_ID else (0 if sp_id == UP_SALES_SPREADSHEET_ID else None))
         )
 
+        if clean_inv:
+            # Si pidió un gid específico, buscar primero ahí; si no está ahí, buscar en TODAS las pestañas del documento
+            tabs_order = []
+            if gid_resolved_tab:
+                tabs_order.append(gid_resolved_tab)
+            for t in all_tabs:
+                if t not in tabs_order:
+                    tabs_order.append(t)
+
+            all_found_breakdowns = []
+            for tab in tabs_order:
+                matches = _direct_find_all_invoice_rows(sp_id, tab, clean_inv, preferred_col)
+                if matches:
+                    headers = _direct_get_sheet_headers(sp_id, tab)
+                    for m in matches:
+                        bd = _direct_build_row_cell_breakdown(
+                            sheet_type, tab, m["rowIndex"], m["rowValues"], headers, cell_param
+                        )
+                        if gid_resolved_tab and gid_resolved_tab != tab:
+                            bd["notaGid"] = (
+                                f"El enlace proporcionado apuntaba al gid={parsed['gid']} (pestaña '{gid_resolved_tab}'), "
+                                f"pero el invoice {clean_inv} fue localizado en la pestaña '{tab}' (fila {m['rowIndex']}) de este mismo documento."
+                            )
+                        all_found_breakdowns.append(bd)
+
+            if all_found_breakdowns:
+                key_name = (
+                    "master_shippings"
+                    if sp_id == MASTER_SHIPPINGS_SPREADSHEET_ID
+                    else ("customer_information" if sp_id == CUSTOMER_INFO_SPREADSHEET_ID else ("up_sales" if sp_id == UP_SALES_SPREADSHEET_ID else "custom_sheet"))
+                )
+                resultados[key_name] = all_found_breakdowns[0]
+                if len(all_found_breakdowns) > 1:
+                    resultados[f"{key_name}_todas_las_filas"] = all_found_breakdowns
+            else:
+                resultados[" Busqueda"] = {
+                    "encontrado": False,
+                    "spreadsheetId": sp_id,
+                    "titulo": meta.get("title") if meta else sp_id,
+                    "pestañasRevisadas": tabs_order,
+                    "gidSolicitado": parsed["gid"],
+                    "pestañaGidSolicitado": gid_resolved_tab,
+                    "mensaje": f"No se encontró el invoice {clean_inv} en ninguna pestaña ({', '.join(tabs_order)}) del documento.",
+                }
+        else:
+            target_tab = gid_resolved_tab or (year_param if year_param in all_tabs else all_tabs[0])
+            headers = _direct_get_sheet_headers(sp_id, target_tab)
+            rows = _direct_get_sheet_values(sp_id, f"'{target_tab}'!A{req_row}:AZ{req_row}")
+            row_vals = rows[0] if rows else []
+            resultados["fila_leida"] = _direct_build_row_cell_breakdown(
+                sheet_type, target_tab, req_row, row_vals, headers, cell_param
+            )
+
         return {
-            "invoice": record.get("invoice") or clean_inv,
-            "year_tab": record.get("year") or "",
-            "fila_customer_information": record.get("rowIndex"),
-            "fila_master_shippings": record.get("masterRowIndex") if record.get("foundInMaster") else None,
-            "pestaña_master_shippings": record.get("masterSheetName") if record.get("foundInMaster") else None,
-            "nombre_completo": full_name,
-            "nombre": record.get("name") or "",
-            "apellido": record.get("lastName") or "",
-            "tienda": record.get("storeName") or "",
-            "fecha_venta": record.get("fecha") or "",
-            "vendedor_sales_rep": record.get("salesRep") or record.get("masterSalesRep") or "",
-            "direccion_address_1": address_street,
-            "ciudad_city": city_val,
-            "region_state": state_val,
-            "codigo_postal_zip": zip_val,
-            "pais_country": country_val,
-            "direccion_completa": full_address,
-            "productos": record.get("products") or "",
-            "telefono_original": raw_phone,
-            "telefono_sanitizado": display_phone,
-            "telefono_estado": phone_status,
-            "email_original": raw_email,
-            "email_sanitizado": display_email,
-            "email_estado": email_status,
-            "shipping": record.get("shipping") or "",
-            "notas": record.get("csComment") or "",
-            # Bloques semánticos explícitos para distinguir Contacto vs Dirección con coordenadas de celda
-            "datos_de_contacto_del_cliente": {
-                "descripcion": "Datos de contacto e identidad directa del cliente (Nombre, Apellido, Teléfono, Email)",
-                "nombre_completo": full_name,
-                "nombre": record.get("name") or "",
-                "apellido": record.get("lastName") or "",
-                "telefono_sanitizado": display_phone,
-                "telefono_original": raw_phone,
-                "telefono_estado": phone_status,
-                "email_sanitizado": display_email,
-                "email_original": raw_email,
-                "email_estado": email_status,
-                "ubicacion_celdas": record.get("datosContactoCliente") or {},
+            "success": True,
+            "consulta": {
+                "invoice": clean_inv or None,
+                "filaSolicitada": req_row or None,
+                "celdaOColumnaSolicitada": cell_param or None,
+                "spreadsheetId": sp_id,
+                "gid": parsed["gid"],
+                "pestañaGid": gid_resolved_tab,
             },
-            "direccion_del_cliente": {
-                "descripcion": "Ubicación física / dirección postal de envío del cliente (Calle/Street, Ciudad, Estado, Código Postal, País)",
-                "calle_address_1": address_street,
-                "ciudad_city": city_val,
-                "estado_state": state_val,
-                "codigo_postal_zip": zip_val,
-                "pais_country": country_val,
-                "direccion_completa_formateada": full_address,
-                "ubicacion_celdas": record.get("direccionCliente") or {},
-            },
-            "lectura_filas_y_celdas": record.get("lecturaFilasYCeldas") or {},
-            # Distinción de Hojas y Datos de MASTER SHIPPINGS
-            "found_in_master": record.get("foundInMaster", False),
-            "master_shippings_products": record.get("masterProducts") or "",
-            "master_shippings_notes": record.get("masterNotes") or "",
-            "master_tracking": record.get("masterTracking") or "",
-            "master_shipped": record.get("masterShipped") or "",
-            "master_arrived": record.get("masterArrived") or "",
-            "is_shipping_no": record.get("isShippingNo", False),
-            "has_pending_products": record.get("hasPendingProducts", False),
-            "pending_reason": record.get("pendingReason") or ""
+            "resultados": resultados,
+        }
+
+    # Caso 2: Búsqueda multi-hoja ("ambas" o "todas")
+    include_cust = parsed["alias"] in ("ambas", "both", "todas", "all", "customer_information")
+    include_master = parsed["alias"] in ("ambas", "both", "todas", "all", "master_shippings")
+    include_upsales = parsed["alias"] in ("ambas", "both", "todas", "all", "up_sales")
+
+    if include_cust:
+        if clean_inv:
+            found_c = []
+            for tab in ["2026", "2025", "2024", "2023"]:
+                matches = _direct_find_all_invoice_rows(CUSTOMER_INFO_SPREADSHEET_ID, tab, clean_inv, 1)
+                if matches:
+                    headers = _direct_get_sheet_headers(CUSTOMER_INFO_SPREADSHEET_ID, tab)
+                    for m in matches:
+                        found_c.append(
+                            _direct_build_row_cell_breakdown(
+                                "customer_information", tab, m["rowIndex"], m["rowValues"], headers, cell_param
+                            )
+                        )
+                    break
+            if found_c:
+                resultados["customer_information"] = found_c[0]
+                if len(found_c) > 1:
+                    resultados["customer_information_todas_las_filas"] = found_c
+            else:
+                resultados["customer_information"] = {
+                    "encontrado": False,
+                    "mensaje": f"No se encontró el invoice {clean_inv} en Customer Information - Shippings.",
+                }
+        else:
+            headers = _direct_get_sheet_headers(CUSTOMER_INFO_SPREADSHEET_ID, year_param)
+            rows = _direct_get_sheet_values(
+                CUSTOMER_INFO_SPREADSHEET_ID, f"'{year_param}'!A{req_row}:AZ{req_row}"
+            )
+            row_vals = rows[0] if rows else []
+            resultados["customer_information"] = _direct_build_row_cell_breakdown(
+                "customer_information", year_param, req_row, row_vals, headers, cell_param
+            )
+
+    if include_master:
+        if clean_inv:
+            found_m = []
+            for tab in ["2026", "2025", "2024", "2023"]:
+                matches = _direct_find_all_invoice_rows(MASTER_SHIPPINGS_SPREADSHEET_ID, tab, clean_inv, 4)
+                if matches:
+                    headers = _direct_get_sheet_headers(MASTER_SHIPPINGS_SPREADSHEET_ID, tab)
+                    for m in matches:
+                        found_m.append(
+                            _direct_build_row_cell_breakdown(
+                                "master_shippings", tab, m["rowIndex"], m["rowValues"], headers, cell_param
+                            )
+                        )
+            if found_m:
+                resultados["master_shippings"] = found_m[0]
+                resultados["master_shippings_todas_las_filas"] = found_m
+            else:
+                resultados["master_shippings"] = {
+                    "encontrado": False,
+                    "mensaje": f"No se encontró el invoice {clean_inv} en MASTER SHIPPINGS.",
+                }
+        else:
+            headers = _direct_get_sheet_headers(MASTER_SHIPPINGS_SPREADSHEET_ID, year_param)
+            rows = _direct_get_sheet_values(
+                MASTER_SHIPPINGS_SPREADSHEET_ID, f"'{year_param}'!A{req_row}:AZ{req_row}"
+            )
+            row_vals = rows[0] if rows else []
+            resultados["master_shippings"] = _direct_build_row_cell_breakdown(
+                "master_shippings", year_param, req_row, row_vals, headers, cell_param
+            )
+
+    if include_upsales and clean_inv:
+        found_u = []
+        for tab in ["DAILY REPORT", "Animations"]:
+            matches = _direct_find_all_invoice_rows(UP_SALES_SPREADSHEET_ID, tab, clean_inv, 0)
+            if matches:
+                headers = _direct_get_sheet_headers(UP_SALES_SPREADSHEET_ID, tab)
+                for m in matches:
+                    found_u.append(
+                        _direct_build_row_cell_breakdown(
+                            "up_sales", tab, m["rowIndex"], m["rowValues"], headers, cell_param
+                        )
+                    )
+        if found_u:
+            resultados["up_sales_report"] = found_u[0]
+            if len(found_u) > 1:
+                resultados["up_sales_report_todas_las_filas"] = found_u
+
+    return {
+        "success": True,
+        "consulta": {
+            "invoice": clean_inv or None,
+            "filaSolicitada": req_row or None,
+            "celdaOColumnaSolicitada": cell_param or None,
+            "hojaSolicitada": raw_sheet_input,
+            "anioPestaña": year_param,
+        },
+        "resultados": resultados,
+    }
+
+
+def explorar_catalogo_hojas_drive(spreadsheet_url_o_id: str = "") -> dict:
+    """
+    Descubre y lista TODAS las hojas de cálculo (Google Sheets) a las que Angy y la aplicación tienen acceso
+    en Google Drive, o inspecciona a fondo las pestañas (nombres, GIDs, número de filas/columnas y encabezados A..AZ)
+    de cualquier documento específico (pasando su link de Google Sheets o su Spreadsheet ID).
+    Úsala cuando necesites saber qué hojas existen más allá de MASTER SHIPPINGS y Customer Information (ej. UP SALES REPORT),
+    o cuando el usuario te comparta un enlace de Google Sheets con `#gid=...` para saber a qué pestaña corresponde.
+    """
+    raw_target = str(spreadsheet_url_o_id or "").strip()
+    if raw_target:
+        parsed = _parse_spreadsheet_input(raw_target)
+        sp_id = parsed.get("spreadsheetId") or raw_target
+        meta = _direct_get_spreadsheet_meta(sp_id)
+        if not meta:
+            return {"error": f"No se pudo inspeccionar el documento {sp_id}. Verifica que esté compartido con la cuenta de servicio."}
+        for sh in meta.get("sheets", []):
+            sh["encabezados"] = _direct_get_sheet_headers(sp_id, sh["title"])
+        return {
+            "success": True,
+            "spreadsheet": meta,
+            "gidDetectadoEnLink": parsed.get("gid"),
+        }
+
+    # Listar todos los archivos Google Sheets en Drive
+    token = _get_direct_google_token()
+    if not token:
+        return {"error": "No se pudo obtener token OAuth2 para consultar Google Drive."}
+
+    try:
+        q = urllib.parse.quote("mimeType='application/vnd.google-apps.spreadsheet' and trashed=false")
+        drive_url = f"https://www.googleapis.com/drive/v3/files?q={q}&fields=files(id,name,webViewLink,modifiedTime)&pageSize=50"
+        resp = requests.get(drive_url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+        files = resp.json().get("files", []) if resp.status_code == 200 else []
+        catalogo = []
+        for f in files:
+            meta = _direct_get_spreadsheet_meta(f["id"])
+            catalogo.append(
+                {
+                    "spreadsheetId": f["id"],
+                    "nombre": f.get("name"),
+                    "url": f.get("webViewLink"),
+                    "ultimaModificacion": f.get("modifiedTime"),
+                    "pestañas": meta.get("sheets", []) if meta else [],
+                }
+            )
+        return {
+            "success": True,
+            "totalHojasAccesibles": len(catalogo),
+            "hojas": catalogo,
         }
     except Exception as e:
-        return {"error": f"Error de conexión con el backend: {str(e)}"}
+        return {"error": f"Error explorando catálogo de hojas en Google Drive: {str(e)}"}
+
+
+def buscar_y_sanitizar_cliente(invoice: str) -> dict:
+    """
+    Busca los datos de un cliente en Google Sheets (en Customer Information - Shippings, MASTER SHIPPINGS
+    y UP SALES REPORT en todas las pestañas 2023, 2024, 2025, 2026 y DAILY REPORT) por su número de invoice,
+    lee TODAS las filas donde aparezca con sus coordenadas de celda (Columnas A..AZ + Número de fila),
+    extrae TODOS los números de tracking de los 4 bloques de proveedores en MASTER SHIPPINGS:
+      - Bloque 1 (P..U): ZERO GRAVITY -> Tracking # en Columna R
+      - Bloque 2 (V..AA): Empire Tech -> Tracking # en Columna X
+      - Bloque 3 (AB..AG): STEMTOX / INTERNAL -> Tracking # en Columna AD
+      - Bloque 4 (AH..AM): SPACETOUCH -> Tracking # en Columna AJ
+      - Columna AN: ESTADO
+    Clasifica semánticamente 'Datos de contacto del cliente' vs 'Dirección del cliente' vs 'Seguimiento y Logística (Tracking)',
+    y bloquea estrictamente los teléfonos y correos corporativos (ej. 8882494189).
+    """
+    clean_inv = str(invoice or "").strip()
+    if not clean_inv:
+        return {"error": "Debes proporcionar un número de invoice válido."}
+
+    # Usamos el motor directo universal (A:AZ + multi-fila + multi-hoja) para garantizar 0 fallos de conexión y lectura completa A..AN
+    direct_data = _direct_read_row_cells(invoice=clean_inv, hoja="todas")
+    res_map = direct_data.get("resultados", {}) if isinstance(direct_data, dict) else {}
+
+    cust_bd = res_map.get("customer_information")
+    has_cust = isinstance(cust_bd, dict) and cust_bd.get("encontrado") is not False and bool(cust_bd.get("fila"))
+
+    master_bds = res_map.get("master_shippings_todas_las_filas") or (
+        [res_map["master_shippings"]]
+        if (isinstance(res_map.get("master_shippings"), dict) and res_map["master_shippings"].get("encontrado") is not False and res_map["master_shippings"].get("fila"))
+        else []
+    )
+    has_master = len(master_bds) > 0
+
+    upsales_bd = res_map.get("up_sales_report")
+    has_upsales = isinstance(upsales_bd, dict) and bool(upsales_bd.get("fila"))
+
+    if not has_cust and not has_master and not has_upsales:
+        return {
+            "error": f"No se encontró registro en Google Sheets (Customer Information, MASTER SHIPPINGS ni UP SALES REPORT) para la factura {clean_inv}. Puedes usar 'escanear_y_rellenar_master_shippings' o 'obtener_textos_de_archivos' para buscarla directamente en ShareFile."
+        }
+
+    def _cell_val(bd: dict | None, col_letter: str) -> str:
+        if not bd or not isinstance(bd, dict):
+            return ""
+        return str(bd.get("celdasPorColumna", {}).get(col_letter, {}).get("valor") or "").strip()
+
+    first_master = master_bds[0] if has_master else None
+
+    # Extraer campos combinando Customer Info, MASTER SHIPPINGS y UP SALES REPORT
+    name_cust = _cell_val(cust_bd, "E")
+    last_cust = _cell_val(cust_bd, "F")
+    full_name_master = _cell_val(first_master, "C")
+    full_name_upsales = _cell_val(upsales_bd, "D")
+    full_name = (
+        f"{name_cust} {last_cust}".strip()
+        or full_name_master
+        or full_name_upsales
+    )
+    if not name_cust and full_name:
+        parts = full_name.split()
+        name_cust = parts[0] if parts else ""
+        last_cust = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+    raw_phone = _cell_val(cust_bd, "G") or _cell_val(first_master, "D")
+    clean_phone = "".join(filter(str.isdigit, raw_phone))
+    if len(clean_phone) > 10:
+        clean_phone = clean_phone[-10:]
+
+    if clean_phone in COMPANY_PHONES:
+        phone_status = "BLOQUEADO (Es el número corporativo de la empresa)"
+        display_phone = ""
+    elif len(clean_phone) < 10:
+        phone_status = "Inválido (menos de 10 dígitos)"
+        display_phone = ""
+    else:
+        phone_status = "Válido"
+        display_phone = clean_phone
+
+    raw_email = (
+        _cell_val(cust_bd, "H")
+        or _cell_val(first_master, "B")
+        or _cell_val(upsales_bd, "R")
+        or _cell_val(upsales_bd, "H")
+    ).strip().lower()
+    is_corporate_email = any(
+        word in raw_email
+        for word in [
+            "customerservice", "noreply", "info@", "support@", "hello@", "contact@", "admin@", "sales@", "cs"
+        ]
+    )
+    if is_corporate_email:
+        email_status = "BLOQUEADO (Correo corporativo de soporte)"
+        display_email = ""
+    else:
+        email_status = "Válido" if raw_email else "Vacío"
+        display_email = raw_email
+
+    address_street = _cell_val(first_master, "F")
+    city_val = _cell_val(first_master, "G") or _cell_val(upsales_bd, "F")
+    state_val = _cell_val(first_master, "H") or _cell_val(cust_bd, "I")
+    zip_val = _cell_val(first_master, "I") or _cell_val(cust_bd, "J")
+    country_val = _cell_val(first_master, "J")
+    full_address = ", ".join([p for p in [address_street, city_val, state_val, zip_val, country_val] if p])
+
+    # Consolidar productos, notas y TODOS los números de tracking de TODAS las filas de MASTER SHIPPINGS
+    master_rows_summary = []
+    all_active_trackings = []
+    master_products_list = []
+    master_notes_list = []
+
+    for mbd in master_bds:
+        r_num = mbd.get("fila")
+        tab_m = mbd.get("pestaña")
+        prod_m = _cell_val(mbd, "M")
+        note_m = _cell_val(mbd, "N")
+        if prod_m:
+            master_products_list.append(f"[Fila {r_num}] {prod_m}" if len(master_bds) > 1 else prod_m)
+        if note_m:
+            master_notes_list.append(f"[Fila {r_num}] {note_m}" if len(master_bds) > 1 else note_m)
+
+        seg = mbd.get("seguimientoLogisticaTracking") or {}
+        row_trackings = seg.get("trackingsActivos") or []
+        for rt in row_trackings:
+            entry = dict(rt)
+            entry["fila"] = r_num
+            entry["pestaña"] = tab_m
+            all_active_trackings.append(entry)
+
+        master_rows_summary.append(
+            {
+                "pestaña": tab_m,
+                "fila": r_num,
+                "productos_columna_M": {"celda": f"M{r_num}", "valor": prod_m},
+                "notas_columna_N": {"celda": f"N{r_num}", "valor": note_m},
+                "tracking_received_columna_O": {"celda": f"O{r_num}", "valor": _cell_val(mbd, "O")},
+                "estado_columna_AN": {"celda": f"AN{r_num}", "valor": _cell_val(mbd, "AN")},
+                "trackings_activos_en_fila": row_trackings,
+            }
+        )
+
+    primary_tracking = ""
+    primary_shipped = ""
+    primary_arrived = ""
+    for t_item in all_active_trackings:
+        t_val = str(t_item.get("trackingNumber") or "")
+        if t_val and not t_val.startswith("(Pendiente"):
+            primary_tracking = f"{t_val} ({t_item.get('celdaTracking')} - {t_item.get('bloqueProveedor')})"
+            primary_shipped = t_item.get("shipped") or ""
+            primary_arrived = t_item.get("arrived") or ""
+            break
+
+    shipping_col_m_cust = _cell_val(cust_bd, "M")
+    is_shipping_no = shipping_col_m_cust.upper() in ("NO", "N")
+
+    return {
+        "invoice": clean_inv,
+        "year_tab": (cust_bd.get("pestaña") if has_cust else (first_master.get("pestaña") if has_master else "2026")),
+        "fila_customer_information": cust_bd.get("fila") if has_cust else None,
+        "fila_master_shippings": first_master.get("fila") if has_master else None,
+        "filas_master_shippings": [m.get("fila") for m in master_bds],
+        "pestaña_master_shippings": first_master.get("pestaña") if has_master else None,
+        "fila_up_sales_report": upsales_bd.get("fila") if has_upsales else None,
+        "sharefile_link_up_sales": _cell_val(upsales_bd, "G") if has_upsales else "",
+        "nombre_completo": full_name,
+        "nombre": name_cust,
+        "apellido": last_cust,
+        "tienda": _cell_val(cust_bd, "D") or _cell_val(first_master, "K") or _cell_val(upsales_bd, "E"),
+        "fecha_venta": _cell_val(cust_bd, "A") or _cell_val(first_master, "A") or _cell_val(upsales_bd, "B"),
+        "total_venta": _cell_val(cust_bd, "C") or _cell_val(upsales_bd, "C"),
+        "vendedor_sales_rep": _cell_val(first_master, "L") or _cell_val(upsales_bd, "Q"),
+        "direccion_address_1": address_street,
+        "ciudad_city": city_val,
+        "region_state": state_val,
+        "codigo_postal_zip": zip_val,
+        "pais_country": country_val,
+        "direccion_completa": full_address,
+        "productos": _cell_val(cust_bd, "K") or " | ".join(master_products_list),
+        "telefono_original": raw_phone,
+        "telefono_sanitizado": display_phone,
+        "telefono_estado": phone_status,
+        "email_original": raw_email,
+        "email_sanitizado": display_email,
+        "email_estado": email_status,
+        "shipping": shipping_col_m_cust or ("YES" if has_master else ""),
+        "notas": _cell_val(cust_bd, "O") or " | ".join(master_notes_list),
+        "datos_de_contacto_del_cliente": {
+            "descripcion": "Datos de contacto e identidad directa del cliente (Nombre, Apellido, Teléfono, Email)",
+            "nombre_completo": full_name,
+            "nombre": name_cust,
+            "apellido": last_cust,
+            "telefono_sanitizado": display_phone,
+            "telefono_original": raw_phone,
+            "telefono_estado": phone_status,
+            "email_sanitizado": display_email,
+            "email_original": raw_email,
+            "email_estado": email_status,
+            "ubicacion_celdas": {
+                "customer_information": cust_bd.get("datosContactoCliente", {}).get("campos", {}) if has_cust else None,
+                "master_shippings": first_master.get("datosContactoCliente", {}).get("campos", {}) if has_master else None,
+            },
+        },
+        "direccion_del_cliente": {
+            "descripcion": "Ubicación física / dirección postal de envío del cliente (Calle/Street, Ciudad, Estado, Código Postal, País)",
+            "calle_address_1": address_street,
+            "ciudad_city": city_val,
+            "estado_state": state_val,
+            "codigo_postal_zip": zip_val,
+            "pais_country": country_val,
+            "direccion_completa_formateada": full_address,
+            "ubicacion_celdas": {
+                "customer_information": cust_bd.get("direccionCliente", {}).get("campos", {}) if has_cust else None,
+                "master_shippings": first_master.get("direccionCliente", {}).get("campos", {}) if has_master else None,
+            },
+        },
+        "seguimiento_y_tracking_master_shippings": {
+            "total_filas_en_master_shippings": len(master_bds),
+            "tracking_principal_detectado": primary_tracking,
+            "todos_los_trackings_y_bloques_activos": all_active_trackings,
+            "resumen_por_fila_master": master_rows_summary,
+        },
+        "lectura_filas_y_celdas": {
+            "customer_information": cust_bd if has_cust else None,
+            "master_shippings": first_master if has_master else None,
+            "master_shippings_todas_las_filas": master_bds,
+            "up_sales_report": upsales_bd if has_upsales else None,
+        },
+        "found_in_master": has_master,
+        "master_shippings_products": " | ".join(master_products_list),
+        "master_shippings_notes": " | ".join(master_notes_list),
+        "master_tracking": primary_tracking,
+        "master_all_trackings": all_active_trackings,
+        "master_shipped": primary_shipped,
+        "master_arrived": primary_arrived,
+        "is_shipping_no": is_shipping_no,
+        "has_pending_products": bool(master_products_list),
+        "pending_reason": "Productos registrados en Columna M (PRODUCTS) de MASTER SHIPPINGS" if master_products_list else "",
+    }
 
 
 def leer_fila_y_celdas_sheets(
     invoice: str = "",
     fila: int = 0,
     columna_o_celda: str = "",
-    hoja: str = "ambas",
-    anio: str = "2026"
+    hoja: str = "todas",
+    anio: str = "2026",
+    spreadsheet_url_o_id: str = "",
+    gid: str = "",
 ) -> dict:
     """
-    Lee toda una fila completa de Google Sheets (en Customer Information - Shippings y/o MASTER SHIPPINGS)
-    y devuelve el desglose exacto celda por celda (Columna A hasta Z), indicando:
-    1. A qué columna (Letra A..Z y nombre del encabezado) y coordenada (ej. E45, F45) corresponde cada valor de la fila.
+    Lee toda una fila completa (o todas las filas asociadas a un invoice) en Google Sheets desde la Columna A hasta AZ (40+ columnas),
+    soportando tanto las hojas principales ('Customer Information - Shippings', 'MASTER SHIPPINGS', 'UP SALES REPORT')
+    como CUALQUIER enlace/URL de Google Sheets o Spreadsheet ID + GID que comparta el usuario.
+
+    Devuelve el desglose exacto celda por celda (Columna A..AN/AZ), indicando:
+    1. A qué columna (Letra A..AZ y nombre del encabezado) y coordenada (ej. AD3975, F3975) corresponde cada valor.
     2. Qué celdas corresponden a 'DATOS DE CONTACTO DEL CLIENTE' (Nombre, Apellido, Teléfono, Email).
-    3. Qué celdas corresponden a 'DIRECCIÓN DEL CLIENTE' (Address 1 / Calle, City / Ciudad, State / Estado, Zip Code / Código Postal, Country / País).
-    4. Qué celdas corresponden a 'DATOS DE LA VENTA / FACTURA', 'PRODUCTOS Y ENVÍO' y 'SEGUIMIENTO Y LOGÍSTICA (TRACKING)'.
+    3. Qué celdas corresponden a 'DIRECCIÓN DEL CLIENTE' (Address 1 / Calle, City, State, Zip Code, Country).
+    4. En MASTER SHIPPINGS, desglosa explícitamente los 4 bloques de proveedores de Tracking:
+       - Bloque 1 (P..U): ZERO GRAVITY -> Tracking # en Columna R
+       - Bloque 2 (V..AA): Empire Tech -> Tracking # en Columna X
+       - Bloque 3 (AB..AG): STEMTOX / INTERNAL -> Tracking # en Columna AD
+       - Bloque 4 (AH..AM): SPACETOUCH -> Tracking # en Columna AJ
+       - Columna AN: ESTADO
 
     Parámetros:
-    - invoice: (Opcional) Número de factura para localizar automáticamente su fila en las hojas y leer todas sus celdas.
-    - fila: (Opcional) Número de fila exacta en Google Sheets (ej. 45) si el usuario pregunta por un número de fila específico.
-    - columna_o_celda: (Opcional) Letra de columna (ej. 'F', 'G', 'M') o coordenada de celda (ej. 'F45', 'H12') para enfocar una celda específica además de leer la fila completa.
-    - hoja: 'ambas' (por defecto), 'customer_information' o 'master_shippings'.
-    - anio: Pestaña del año ('2026' por defecto, '2025', '2024', '2023') cuando se busca por número de fila.
+    - invoice: (Opcional) Número de factura (ej. '224377') para localizar todas sus filas y leer todas sus celdas A..AZ.
+    - fila: (Opcional) Número de fila exacta en Google Sheets (ej. 3975) si el usuario pregunta por una fila específica.
+    - columna_o_celda: (Opcional) Letra de columna (ej. 'AD', 'R', 'F') o coordenada de celda (ej. 'AD3975') para enfocar una celda específica.
+    - hoja: 'todas' (por defecto), 'ambas', 'master_shippings', 'customer_information', 'up_sales', o una URL/ID de Google Sheets.
+    - anio: Pestaña del año ('2026' por defecto, '2025', '2024', '2023', 'DAILY REPORT').
+    - spreadsheet_url_o_id: (Opcional) URL completa de Google Sheets (ej. 'https://docs.google.com/spreadsheets/d/.../edit?gid=1576484704') o ID.
+    - gid: (Opcional) GID numérico de la pestaña si el usuario lo especificó.
     """
-    params = {}
-    if invoice and str(invoice).strip():
-        params["invoice"] = str(invoice).strip()
-    if fila and int(fila) > 0:
-        params["row"] = str(int(fila))
-    if columna_o_celda and str(columna_o_celda).strip():
-        params["cell"] = str(columna_o_celda).strip().upper()
-    if hoja and str(hoja).strip():
-        params["sheet"] = str(hoja).strip().lower()
-    if anio and str(anio).strip():
-        params["year"] = str(anio).strip()
-
-    try:
-        response = requests.get(f"{BACKEND_URL}/api/sheets/read-row-cells", params=params, timeout=20)
-        if response.status_code != 200:
-            try:
-                err_data = response.json()
-                return {"error": err_data.get("error") or f"Código HTTP {response.status_code}"}
-            except Exception:
-                return {"error": f"No se pudo leer la fila/celdas en el backend. Código: {response.status_code}"}
-        return response.json()
-    except Exception as e:
-        return {"error": f"Error de conexión al leer fila y celdas de Google Sheets: {str(e)}"}
+    return _direct_read_row_cells(
+        invoice=invoice,
+        fila=fila,
+        columna_o_celda=columna_o_celda,
+        hoja=hoja,
+        anio=anio,
+        spreadsheet_url_o_id=spreadsheet_url_o_id,
+        gid=gid,
+    )
 
 
 def consultar_envios_y_motivos(invoice: str) -> dict:
     """
     Consulta todas las filas ("Envíos") asociadas a un mismo número de invoice en Google Sheets
-    (tanto en Customer Information - Shippings como en MASTER SHIPPINGS en todas las pestañas de años 2022-2026).
-    
-    Permite responder preguntas como:
-    - ¿Cuántos envíos tiene este número de invoice?
-    - ¿Cuál es el motivo de este envío / de cada envío?
-    
-    Retorna:
-    - total_envios: Número total de filas/registros de envío encontrados para este invoice.
-    - envios: Lista con el detalle de cada envío (hoja de cálculo, pestaña/año, fila, fecha, tienda, productos, notas y motivo).
-    - resumen: Un texto descriptivo listo para presentar al usuario.
+    (en Customer Information - Shippings, MASTER SHIPPINGS y UP SALES REPORT en todas las pestañas).
+    Incluye todos los números de tracking de los 4 bloques de proveedores (Columnas R, X, AD, AJ) y el motivo de cada envío.
     """
     clean_inv = str(invoice or "").strip()
     if not clean_inv:
         return {"error": "Debe proporcionar un número de invoice válido."}
 
-    try:
-        url = f"{BACKEND_URL}/api/sheets/envios-by-invoice?invoice={urllib.parse.quote(clean_inv)}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Angy-Agent"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            return data
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"Error de conexión consultando envíos para invoice {clean_inv}: {str(e)}"
-        }
+    direct_res = _direct_read_row_cells(invoice=clean_inv, hoja="todas")
+    res_map = direct_res.get("resultados", {}) if isinstance(direct_res, dict) else {}
+    envios = []
+
+    cust_bds = res_map.get("customer_information_todas_las_filas") or (
+        [res_map["customer_information"]]
+        if (isinstance(res_map.get("customer_information"), dict) and res_map["customer_information"].get("fila"))
+        else []
+    )
+    for cbd in cust_bds:
+        c_map = cbd.get("celdasPorColumna", {})
+        shipping_val = c_map.get("M", {}).get("valor", "")
+        notes_val = c_map.get("O", {}).get("valor", "")
+        prods_val = c_map.get("K", {}).get("valor", "")
+        motivo = notes_val or (
+            f"Venta registrada con requerimiento de envío (SHIPPING: {shipping_val})"
+            if shipping_val.upper() in ("YES", "SI")
+            else f"Registro de venta en tienda (SHIPPING: {shipping_val or 'NO'})"
+        )
+        envios.append(
+            {
+                "numero_envio": len(envios) + 1,
+                "hoja": "Customer Information - Shippings",
+                "pestaña": cbd.get("pestaña"),
+                "fila": cbd.get("fila"),
+                "invoice": c_map.get("B", {}).get("valor", clean_inv),
+                "fecha": c_map.get("A", {}).get("valor", ""),
+                "cliente": f"{c_map.get('E', {}).get('valor', '')} {c_map.get('F', {}).get('valor', '')}".strip(),
+                "tienda": c_map.get("D", {}).get("valor", ""),
+                "productos": prods_val,
+                "shipping_columna_M": shipping_val,
+                "notas": notes_val,
+                "motivo": motivo,
+            }
+        )
+
+    master_bds = res_map.get("master_shippings_todas_las_filas") or (
+        [res_map["master_shippings"]]
+        if (isinstance(res_map.get("master_shippings"), dict) and res_map["master_shippings"].get("fila"))
+        else []
+    )
+    for mbd in master_bds:
+        c_map = mbd.get("celdasPorColumna", {})
+        prods_val = c_map.get("M", {}).get("valor", "")
+        notes_val = c_map.get("N", {}).get("valor", "")
+        seg = mbd.get("seguimientoLogisticaTracking") or {}
+        trackings_activos = seg.get("trackingsActivos") or []
+        motivo = notes_val or (
+            f"Despacho de productos en MASTER SHIPPINGS ({prods_val})" if prods_val else "Registro en MASTER SHIPPINGS"
+        )
+        envios.append(
+            {
+                "numero_envio": len(envios) + 1,
+                "hoja": "MASTER SHIPPINGS",
+                "pestaña": mbd.get("pestaña"),
+                "fila": mbd.get("fila"),
+                "invoice": c_map.get("E", {}).get("valor", clean_inv),
+                "fecha": c_map.get("A", {}).get("valor", ""),
+                "cliente": c_map.get("C", {}).get("valor", ""),
+                "tienda": c_map.get("K", {}).get("valor", ""),
+                "vendedor": c_map.get("L", {}).get("valor", ""),
+                "productos_columna_M": prods_val,
+                "notas_columna_N": notes_val,
+                "motivo": motivo,
+                "estado_tracking_columna_O": c_map.get("O", {}).get("valor", ""),
+                "estado_general_columna_AN": c_map.get("AN", {}).get("valor", ""),
+                "trackings_por_proveedor": trackings_activos,
+            }
+        )
+
+    return {
+        "success": True,
+        "invoice": clean_inv,
+        "total_envios": len(envios),
+        "envios": envios,
+    }
+
 
 def consultar_productos_pendientes(invoice: str, buscar_compensaciones_o_regalos: bool = False) -> dict:
     """
@@ -1592,57 +2640,40 @@ Incluye SOLO los campos que el usuario quiere modificar.
       * Cuando el usuario pregunte cuántos envíos tiene un invoice o cuál es el motivo de sus envíos (ej. "¿Cuántos envíos tiene este invoice y cuál es el motivo?"), utiliza SIEMPRE `consultar_envios_y_motivos(invoice)`.
       * Reporta con claridad el número total de envíos (`total_envios`), desglosando cada uno con su número de envío, hoja/pestaña, número de fila, fecha y su **motivo** (extraído de las notas, comentarios o productos asociados a esa fila específica).
 
-15. LECTURA EXHAUSTIVA DE FILAS, COLUMNAS Y CELDAS (Y DISTINCIÓN SEMÁNTICA ENTRE "DIRECCIÓN DEL CLIENTE" Y "DATOS DE CONTACTO DEL CLIENTE"):
-    - Cuando el usuario te pida leer una fila, consultar una celda/columna específica (ej. "lee toda la fila", "¿a qué columna corresponde esta fila/dato?", "¿qué hay en la celda F45?", "¿cuál es la dirección del cliente?" o "¿cuáles son los datos de contacto del cliente?"), utiliza `leer_fila_y_celdas_sheets` o `buscar_y_sanitizar_cliente`.
-    - Domina a la perfección el mapa exacto de columnas de cada hoja y su clasificación semántica:
-      * **HOJA 1: `Customer Information - Shippings` (Columnas A a P)**:
-        - **DATOS DE LA VENTA / FACTURA**:
-          * Columna **A** (`DATE`): Fecha de la venta.
-          * Columna **B** (`INVOICE`): Número de factura.
-          * Columna **C** (`TOTAL`): Monto total de la venta.
-          * Columna **D** (`STORE NAME`): Tienda donde se realizó la compra.
-        - **DATOS DE CONTACTO DEL CLIENTE** (Identidad y medios de comunicación directa con el cliente):
-          * Columna **E** (`NAME`): Nombre(s) del cliente.
-          * Columna **F** (`LAST NAME`): Apellido(s) del cliente.
-          * Columna **G** (`TELEPHONE`): Teléfono del cliente (sanitizado de 10 dígitos, bloqueando siempre el corporativo `8882494189`).
-          * Columna **H** (`EMAIL`): Correo electrónico del cliente.
-        - **DIRECCIÓN DEL CLIENTE** (Ubicación geográfica registrada en Hoja 1):
-          * Columna **I** (`STATE`): Estado / Región del cliente.
-          * Columna **J** (`ZIP CODE`): Código postal del cliente.
-          *(Nota: Hoja 1 solo guarda Estado y Código Postal; la calle, ciudad y país están en MASTER SHIPPINGS).*
-        - **PRODUCTOS Y ENVÍO**:
-          * Columna **K** (`PRODUCTS`): Productos comprados en la nota de venta.
-          * Columna **L** (`INSTRUCTIONS`): Instrucciones enviadas.
-          * Columna **M** (`SHIPPING`): Si requirió envío (`YES` / `NO`).
-          * Columna **N** (`SHIPPING DATE`): Fecha de envío.
-          * Columna **O** (`NOTES`): Notas o comentarios de Customer Service.
-          * Columna **P** (`CS CONTACT`): Contacto de Customer Service.
-      * **HOJA 2: `MASTER SHIPPINGS` (Columnas A a Z)**:
-        - **DATOS DE LA VENTA / FACTURA**:
-          * Columna **A** (`SALE DATE` / `Date`): Fecha de la venta.
-          * Columna **E** (`NOVA INVOICE`): Número de factura.
-          * Columna **K** (`Location - Store`): Tienda / Ubicación de venta.
-          * Columna **L** (`Sales rep`): Vendedor que atendió al cliente.
-        - **DATOS DE CONTACTO DEL CLIENTE** (Identidad y contacto directo en MASTER SHIPPINGS):
-          * Columna **B** (`Email`): Correo electrónico del cliente.
-          * Columna **C** (`Customer Full Name` / `CS Full Name`): Nombre completo del cliente.
-          * Columna **D** (`Phone #`): Teléfono del cliente.
-        - **DIRECCIÓN DEL CLIENTE** (Dirección postal completa de envío en MASTER SHIPPINGS):
-          * Columna **F** (`Address 1 (Street)`): Calle y número exterior/interior del domicilio del cliente.
-          * Columna **G** (`City`): Ciudad del domicilio del cliente.
-          * Columna **H** (`State`): Estado / Provincia del cliente.
-          * Columna **I** (`Zip Code`): Código postal del cliente.
-          * Columna **J** (`Country`): País del domicilio del cliente.
-        - **PRODUCTOS Y ENVÍO**:
-          * Columna **M** (`Products`): Productos pendientes de envío, devolución o compensación.
-          * Columna **N** (`Notes`): Notas del envío o motivo.
-        - **SEGUIMIENTO Y LOGÍSTICA (TRACKING)**:
-          * Columnas **O** (`TRACKING Received/Email sent`), **P** (`Handled`), **Q** (`Shipped`), **R** (`Tracking #`), **S** (`Arrived`), **T** (`Invoice`), **U** (`ZERO GRAVITY`), **V..Z** (Seguimiento Zero Gravity).
-    - **Al presentar la lectura de una fila o responder sobre Dirección vs Datos de Contacto**:
-      * Indica siempre el **número de fila** exacto y la **coordenada de celda** (ej. `F45 (Columna F - Address 1 (Street))`).
-      * Separa claramente qué valores pertenecen a **Datos de Contacto del Cliente** (Nombre, Apellido, Teléfono, Email) y cuáles pertenecen a la **Dirección del Cliente** (Calle/`Address 1`, Ciudad/`City`, Estado/`State`, Código Postal/`Zip Code`, País/`Country`), sin mezclarlos nunca.""",
+15. EXPLORACIÓN UNIVERSAL DE HOJAS DE CÁLCULO (A..AZ), LECTURA EXHAUSTIVA DE FILAS/CELDAS, BLOQUES DE TRACKING POR PROVEEDOR Y "CEREBRO DE LA APP":
+    - Eres el **"Cerebro de la App"**: tu motor de datos no se limita únicamente a 2 hojas fijas. Puedes descubrir e inspeccionar cualquier hoja de cálculo compartida en Google Drive usando `explorar_catalogo_hojas_drive()`, y leer cualquier enlace/URL de Google Sheets (`https://docs.google.com/spreadsheets/d/<ID>/edit?gid=<GID>#gid=<GID>`), Spreadsheet ID o pestaña con `leer_fila_y_celdas_sheets` y `buscar_y_sanitizar_cliente`.
+    - Si el usuario te comparte un link de Google Sheets con `#gid=...` (por ejemplo, `gid=1576484704` que corresponde a la pestaña `2023` en `MASTER SHIPPINGS`) y te pide buscar un invoice que está en otra pestaña del mismo documento (por ejemplo, `224377` en la pestaña `2026`, `gid=0`), `leer_fila_y_celdas_sheets` inspecciona automáticamente primero el `gid` solicitado y luego todas las demás pestañas (`2026`, `2025`, `2024`, `2023`), informándote exactamente en qué pestaña y fila(s) se encuentra.
+    - Domina a la perfección el mapa exacto de las 3 hojas principales y su clasificación semántica:
+      * **HOJA 1: `Customer Information - Shippings` (`1-D0F025w23P9daLlLsfcGAbi9o_pnM1A_p70WtlZdK4`, Columnas A a P)**:
+        - **DATOS DE LA VENTA / FACTURA**: Columna **A** (`DATE`), Columna **B** (`INVOICE`), Columna **C** (`TOTAL`), Columna **D** (`STORE NAME`).
+        - **DATOS DE CONTACTO DEL CLIENTE**: Columna **E** (`NAME`), Columna **F** (`LAST NAME`), Columna **G** (`TELEPHONE`, bloqueando siempre el corporativo `8882494189`), Columna **H** (`EMAIL`).
+        - **DIRECCIÓN DEL CLIENTE**: Columna **I** (`STATE`), Columna **J** (`ZIP CODE`). *(Nota: Hoja 1 solo guarda Estado y Código Postal; la calle, ciudad y país están en MASTER SHIPPINGS).*
+        - **PRODUCTOS Y ENVÍO**: Columna **K** (`PRODUCTS`), Columna **L** (`INSTRUCTIONS`), Columna **M** (`SHIPPING`: `YES`/`NO`), Columna **N** (`SHIPPING DATE`), Columna **O** (`NOTES`), Columna **P** (`CS CONTACT`).
+      * **HOJA 2: `MASTER SHIPPINGS` (`1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY`, 40 Columnas: A hasta AN)**:
+        - **DATOS DE LA VENTA / FACTURA**: Columna **A** (`SALE DATE`), Columna **E** (`NOVA INVOICE`), Columna **K** (`Location - Store`), Columna **L** (`Sales rep`).
+        - **DATOS DE CONTACTO DEL CLIENTE**: Columna **B** (`Email`), Columna **C** (`Customer Full Name` / `CS Full Name`), Columna **D** (`Phone #`).
+        - **DIRECCIÓN DEL CLIENTE**: Columna **F** (`Address 1 (Street)`), Columna **G** (`City`), Columna **H** (`State`), Columna **I** (`Zip Code`), Columna **J** (`Country`).
+        - **PRODUCTOS Y MOTIVO DE ENVÍO**: Columna **M** (`Products`), Columna **N** (`Notes`), Columna **O** (`TRACKING Received/Email sent`).
+        - **LOS 4 BLOQUES DE SEGUIMIENTO Y TRACKING POR PROVEEDOR (Columnas P a AN)**:
+          En `MASTER SHIPPINGS` existen **4 bloques distintos de proveedores** y un mismo invoice puede tener **múltiples filas** (ej. una fila para productos de STEMTOX y otra fila para un dispositivo de SPACETOUCH):
+          1. **Bloque 1 — `ZERO GRAVITY` (Columnas P a U)**:
+             * **P** (`Handled`), **Q** (`Shipped`), **R** (**`Tracking #` de ZERO GRAVITY**), **S** (`Arrived`), **T** (`Invoice`), **U** (`ZERO GRAVITY` - Productos).
+          2. **Bloque 2 — `Empire Tech` (Columnas V a AA)**:
+             * **V** (`Handled`), **W** (`Shipped`), **X** (**`Tracking #` de Empire Tech**), **Y** (`Arrived`), **Z** (`Invoice`), **AA** (`Empire Tech` - Productos).
+          3. **Bloque 3 — `STEMTOX / INTERNAL` (Columnas AB a AG)**:
+             * **AB** (`Handled`), **AC** (`Shipped`), **AD** (**`Tracking #` de STEMTOX / INTERNAL**), **AE** (`Arrived`), **AF** (`Invoice`), **AG** (`STEMTOX / INTERNAL` - Productos).
+          4. **Bloque 4 — `SPACETOUCH` (Columnas AH a AM)**:
+             * **AH** (`Handled`), **AI** (`Shipped`), **AJ** (**`Tracking #` de SPACETOUCH**), **AK** (`Arrived`), **AL** (`Invoice`), **AM** (`SPACETOUCH` - Productos).
+          5. **Columna AN**: `ESTADO` general del envío.
+      * **HOJA 3: `UP SALES REPORT` (`1HgzpKN0pwQqexkUqqjWhPsCaBC9VfvX-Dj8PqhOhA2s`, Pestañas `DAILY REPORT` y `Animations`)**:
+        - En `DAILY REPORT`, los encabezados están en la **Fila 2**: Columna **A** (`INVOICE`), **B** (`DATE`), **C** (`TOTAL`), **D** (`CUSTOMER NAME`), **E** (`LOCATION`), **F** (`CITY`), **G** (`SHAREFILE LINK` — enlace directo a la carpeta de ShareFile del cliente), **H** (`NEW VALID EMAIL`), **I** (`SENT TO VIP`), **N** (`STATUS`), **O** (`Signature`), **P** (`Notes`), **Q** (`Sales Reps`), **R** (`EMAIL`).
+    - **Al responder sobre Tracking, Lectura de Filas/Celdas o Dirección vs Datos de Contacto**:
+      * Si un invoice aparece en **2 o más filas** de `MASTER SHIPPINGS`, reporta **TODAS las filas encontradas** con su número de fila exacto (ej. `Fila 3975` y `Fila 4486`).
+      * Cuando te pregunten por el **número de tracking**, revisa y menciona los 4 bloques de proveedores (`R`, `X`, `AD`, `AJ`), indicando la coordenada exacta de celda (ej. `AD3975`), el proveedor (ej. `STEMTOX / INTERNAL`), fechas de envío/llegada (`Shipped`/`Arrived`) y los productos de ese bloque.
+      * Separa siempre con claridad **Datos de Contacto del Cliente** (Nombre, Apellido, Teléfono, Email) vs **Dirección del Cliente** (`Address 1`, `City`, `State`, `Zip Code`, `Country`) vs **Seguimiento y Logística (Tracking)**.""",
     tools=[
         diagnosticar_y_obtener_contexto_completo,
+        explorar_catalogo_hojas_drive,
         obtener_sesion_activa_frontend,
         consultar_invoice_en_firestore,
         buscar_y_sanitizar_cliente,
