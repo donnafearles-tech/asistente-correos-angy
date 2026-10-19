@@ -282,6 +282,28 @@ def clasificar_archivo_nomenclatura(file_name: str, text: str = "", is_letter_si
     }
 
 
+def formatear_sharefile_folder_url(folder_id_or_url: str) -> str:
+    """
+    Formatea cualquier ID o URL de carpeta de ShareFile al enlace web legacy funcional:
+    https://morenamiabeautygroup.sharefile.com/#/folders/fo<folder_id>
+    """
+    if not folder_id_or_url:
+        return ""
+    raw = str(folder_id_or_url).strip()
+    match = re.search(r"sharefile\.com/(?:fo/|#/folders/|home/shared/)(?:fo)?([a-zA-Z0-9\-]+)", raw, re.IGNORECASE)
+    if match:
+        clean_id = match.group(1)
+    else:
+        clean_id = raw
+
+    # Asegurar el prefijo 'fo'
+    if not clean_id.lower().startswith("fo"):
+        clean_id = f"fo{clean_id}"
+
+    return f"https://morenamiabeautygroup.sharefile.com/#/folders/{clean_id}"
+
+
+
 # ==============================================================================
 # MOTOR UNIVERSAL DIRECTO DE GOOGLE SHEETS Y GOOGLE DRIVE (A:AZ + MULTI-HOJA)
 # ==============================================================================
@@ -1326,7 +1348,7 @@ def buscar_y_sanitizar_cliente(invoice: str) -> dict:
         "filas_master_shippings": [m.get("fila") for m in master_bds],
         "pestaña_master_shippings": first_master.get("pestaña") if has_master else None,
         "fila_up_sales_report": upsales_bd.get("fila") if has_upsales else None,
-        "sharefile_link_up_sales": _cell_val(upsales_bd, "G") if has_upsales else "",
+        "sharefile_link_up_sales": formatear_sharefile_folder_url(_cell_val(upsales_bd, "G")) if (has_upsales and _cell_val(upsales_bd, "G")) else "",
         "nombre_completo": full_name,
         "nombre": name_cust,
         "apellido": last_cust,
@@ -1927,6 +1949,9 @@ def obtener_textos_de_archivos(invoice: str) -> dict:
             )
             f["clasificacion_nomenclatura"] = clasif["categoria"]
             f["isPurchaseInfoShippingDoc"] = bool(f.get("isPurchaseInfoShippingDoc") or clasif["isPurchaseInfoShippingDoc"])
+        folder_id = data.get("folderParentId") or data.get("folderId")
+        if folder_id:
+            data["sharefile_folder_url"] = formatear_sharefile_folder_url(folder_id)
         return data
     except requests.exceptions.ReadTimeout:
         return {"error": f"El escaneo de archivos para el invoice {invoice} tomó más de 180 segundos debido al volumen o tamaño de imágenes en ShareFile. Puedes intentar llamar directamente a 'escanear_y_rellenar_master_shippings'."}
@@ -1980,9 +2005,14 @@ def escanear_y_rellenar_master_shippings(invoice: str, guardar_en_sheets: bool =
             )
             sheet_update_result = upd_res
 
+        folder_id = scan_data.get("folderParentId") or scan_data.get("folderId")
+        folder_url = scan_data.get("sharefileFolderUrl") or (formatear_sharefile_folder_url(folder_id) if folder_id else "")
+
         return {
             "success": True,
             "invoice": invoice,
+            "folder_parent_id": folder_id,
+            "sharefile_folder_url": folder_url,
             "sharefile_auth_mode": "perpetual_oauth2_and_seller_assistant",
             "seller_assistant_url": SELLER_ASSISTANT_URL,
             "datos_extraidos_para_master_shippings": extracted,
@@ -2253,6 +2283,7 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
     invoices_descubiertos_en_carpeta = []
     archivos_carpeta_ganadora = []
     todos_los_archivos_carpeta = []
+    carpeta_ganadora_folder_url = ""
 
     procesados = set()
     idx = 0
@@ -2269,6 +2300,8 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
         raw_negative_products = []
 
         if isinstance(scan_res, dict):
+            if not carpeta_ganadora_folder_url:
+                carpeta_ganadora_folder_url = scan_res.get("sharefile_folder_url") or formatear_sharefile_folder_url(scan_res.get("folderParentId"))
             # Autodescubrimiento de otros invoices en la misma carpeta desde respuesta de la API
             folder_invs = scan_res.get("allInvoicesInFolder") or []
             for f_inv in folder_invs:
@@ -2445,6 +2478,7 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
         "invoice_con_devolucion": invoice_devolucion_seleccionada,
         "carpeta_ganadora": invoice_devolucion_seleccionada or (invoices_iniciales[0] if invoices_iniciales else ""),
         "archivos_carpeta_ganadora": archivos_carpeta_ganadora,
+        "sharefile_folder_url": carpeta_ganadora_folder_url,
         "tiene_shipping_en_carpeta_ganadora": tiene_shipping_file,
         "tiene_vip_en_carpeta_ganadora": tiene_vip_file,
         "tiene_id_en_carpeta_ganadora": tiene_id_file,
@@ -2507,11 +2541,145 @@ def diagnosticar_y_obtener_contexto_completo(invoice: str = "") -> dict:
     }
 
 
+# ─── MEMORIA PERMANENTE DE ANGY (Firestore: angy_knowledge vía backend) ───
+# Lo que Angy aprende en el chat se guarda en Firestore y se inyecta en su prompt en
+# cada sesión, así sobrevive a reinicios/escalado de Cloud Run (las sesiones ADK son en RAM).
+import time
+
+KNOWLEDGE_CACHE_TTL_SECONDS = 60
+KNOWLEDGE_MAX_ITEMS_IN_PROMPT = 60
+_knowledge_cache = {"items": None, "ts": 0.0}
+
+REGEX_PII_EMAIL = re.compile(r"[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}", re.IGNORECASE)
+REGEX_PII_PHONE = re.compile(r"(?<!\d)(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}(?!\d)")
+
+
+def _detectar_datos_personales(texto: str) -> list[str]:
+    """Devuelve los datos personales (emails/teléfonos de clientes) encontrados en el texto."""
+    hallazgos = REGEX_PII_EMAIL.findall(texto or "")
+    for tel in REGEX_PII_PHONE.findall(texto or ""):
+        if re.sub(r"\D", "", tel) not in COMPANY_PHONES:
+            hallazgos.append(tel)
+    return hallazgos
+
+
+def _obtener_aprendizajes_cacheados(forzar: bool = False) -> list[dict]:
+    ahora = time.time()
+    if not forzar and _knowledge_cache["items"] is not None and ahora - _knowledge_cache["ts"] < KNOWLEDGE_CACHE_TTL_SECONDS:
+        return _knowledge_cache["items"]
+    try:
+        resp = requests.get(f"{BACKEND_URL}/api/angy/knowledge", timeout=4, headers={"User-Agent": "AngyAgent/1.0"})
+        data = resp.json() if resp.ok else {}
+        if data.get("success"):
+            _knowledge_cache["items"] = data.get("items", [])
+            _knowledge_cache["ts"] = ahora
+    except Exception as e:
+        print(f"[Angy Memoria] No se pudieron cargar aprendizajes: {e}")
+    return _knowledge_cache["items"] or []
+
+
+def _bloque_aprendizajes_para_prompt() -> str:
+    items = _obtener_aprendizajes_cacheados()[:KNOWLEDGE_MAX_ITEMS_IN_PROMPT]
+    if not items:
+        return ""
+    lineas = [
+        f"- [{it.get('id', '')}] ({it.get('categoria', 'regla')}) {str(it.get('texto', '')).strip()[:400]}"
+        for it in items if str(it.get("texto", "")).strip()
+    ]
+    return (
+        "\n\n18. APRENDIZAJES PERMANENTES (memoria guardada en Firestore desde chats anteriores):\n"
+        "    Aplícalos siempre. Si alguno contradice las reglas 1-17, ganan las reglas 1-17.\n"
+        + "\n".join(lineas)
+    )
+
+
+def guardar_aprendizaje(texto: str, categoria: str = "regla", contexto: str = "", invoice: str = "") -> dict:
+    """Guarda de forma PERMANENTE (Firestore) una regla, corrección o preferencia que el usuario me enseñó en el chat,
+    para aplicarla en todas las sesiones futuras aunque se reinicie la instancia.
+    Args:
+        texto: La regla general y reutilizable, redactada de forma clara y autónoma (sin datos personales de clientes).
+        categoria: Una de 'regla', 'correccion', 'preferencia', 'dato_negocio'.
+        contexto: Frase original del usuario que motivó el aprendizaje (resumida).
+        invoice: Invoice donde surgió el aprendizaje (opcional).
+    """
+    pii = _detectar_datos_personales(f"{texto} {contexto}")
+    if pii:
+        return {
+            "estado": "rechazado",
+            "motivo": "El aprendizaje contiene datos personales de clientes (email/teléfono). Reformúlalo como regla general sin esos datos.",
+            "datos_detectados": pii,
+        }
+    try:
+        resp = requests.post(
+            f"{BACKEND_URL}/api/angy/knowledge",
+            json={"texto": texto, "categoria": categoria, "contexto": contexto, "invoice": invoice},
+            timeout=10,
+        )
+        data = resp.json()
+        _obtener_aprendizajes_cacheados(forzar=True)
+        if data.get("success"):
+            return {"estado": "guardado", "id": data.get("id"), "ya_existia": data.get("duplicado", False), "texto": texto}
+        return {"estado": "error", "mensaje": data.get("error", "Error desconocido")}
+    except Exception as e:
+        return {"estado": "error", "mensaje": f"No pude guardar el aprendizaje: {e}"}
+
+
+def listar_aprendizajes() -> dict:
+    """Lista todos los aprendizajes permanentes activos que tengo guardados en Firestore (con su id, categoría y fecha)."""
+    items = _obtener_aprendizajes_cacheados(forzar=True)
+    return {
+        "total": len(items),
+        "aprendizajes": [
+            {k: it.get(k) for k in ("id", "texto", "categoria", "invoice", "creadoEn", "actualizadoEn")}
+            for it in items
+        ],
+    }
+
+
+def olvidar_aprendizaje(id: str, motivo: str = "") -> dict:
+    """Desactiva (olvida) un aprendizaje permanente por su id cuando el usuario dice que ya no aplica o que lo olvide.
+    Usa listar_aprendizajes() primero si no conoces el id."""
+    try:
+        resp = requests.delete(
+            f"{BACKEND_URL}/api/angy/knowledge/{urllib.parse.quote(str(id).strip())}",
+            json={"motivo": motivo},
+            timeout=10,
+        )
+        data = resp.json()
+        _obtener_aprendizajes_cacheados(forzar=True)
+        if data.get("success"):
+            return {"estado": "olvidado", "id": id, "texto": data.get("texto")}
+        return {"estado": "error", "mensaje": data.get("error", "Error desconocido")}
+    except Exception as e:
+        return {"estado": "error", "mensaje": f"No pude olvidar el aprendizaje: {e}"}
+
+
+REGLA_AUTO_APRENDIZAJE = """
+
+17. MEMORIA PERMANENTE Y AUTO-APRENDIZAJE:
+    - Tengo memoria permanente en Firestore. Lo que guardo con `guardar_aprendizaje` sobrevive a reinicios y lo aplico en todas las sesiones futuras.
+    - Detecto AUTOMÁTICAMENTE cuando el usuario me corrige o me enseña algo ("no, eso está mal...", "a partir de ahora...", "recuerda que...", "siempre...", "nunca...", "eso se hace así...") y llamo a `guardar_aprendizaje` sin que me lo pidan.
+    - SOLO guardo reglas GENERALES y reutilizables (nomenclatura de archivos, criterios de negocio, preferencias de formato, nombres de productos, procedimientos). Redacto el texto de forma clara y autónoma para que se entienda sin el chat.
+    - ESTÁ ESTRICTAMENTE PROHIBIDO guardar datos personales de clientes (emails, teléfonos, direcciones, nombres) o datos que solo apliquen a un caso puntual.
+    - Antes de guardar reviso la sección 18 (aprendizajes existentes): si ya existe algo equivalente no lo duplico; si lo corrige, uso `olvidar_aprendizaje` con el anterior y guardo el nuevo.
+    - Si un aprendizaje contradice las reglas 1-16, NO lo guardo y le explico al usuario el conflicto.
+    - Tras guardar, confirmo SIEMPRE en una línea que empiece exactamente con: "🧠 Aprendí:" seguido del texto guardado.
+    - Si el usuario dice "olvida eso" / "eso ya no aplica", uso `olvidar_aprendizaje` y confirmo con "🧹 Olvidé:".
+    - Si me preguntan qué he aprendido, uso `listar_aprendizajes`."""
+
+
+def _crear_instruction_provider(base_instruction: str):
+    """InstructionProvider de ADK: prompt base + regla 17 + aprendizajes de Firestore (caché 60 s)."""
+    def _provider(_ctx) -> str:
+        return base_instruction + REGLA_AUTO_APRENDIZAJE + _bloque_aprendizajes_para_prompt()
+    return _provider
+
+
 root_agent = Agent(
     model='gemini-2.5-flash',
     name='root_agent',
     description='Asistente experta Angy para Shipping Autofill, MASTER SHIPPINGS y redacción de correos.',
-    instruction="""Eres Angy, la agente experta e imbricada en el pipeline de Shipping Autofill y MASTER SHIPPINGS.
+    instruction=_crear_instruction_provider("""Eres Angy, la agente experta e imbricada en el pipeline de Shipping Autofill y MASTER SHIPPINGS.
 Hablas el mismo idioma técnico que la aplicación y dominas las reglas de nomenclatura Regex, los 3 momentos de telemetría de escaneo y la autorización perpetua con ShareFile.
 
 IDENTIDAD, GÉNERO, TONO Y PERSONAS CLAVE:
@@ -2667,15 +2835,37 @@ Incluye SOLO los campos que el usuario quiere modificar.
           5. **Columna AN**: `ESTADO` general del envío.
       * **HOJA 3: `UP SALES REPORT` (`1HgzpKN0pwQqexkUqqjWhPsCaBC9VfvX-Dj8PqhOhA2s`, Pestañas `DAILY REPORT` y `Animations`)**:
         - En `DAILY REPORT`, los encabezados están en la **Fila 2**: Columna **A** (`INVOICE`), **B** (`DATE`), **C** (`TOTAL`), **D** (`CUSTOMER NAME`), **E** (`LOCATION`), **F** (`CITY`), **G** (`SHAREFILE LINK` — enlace directo a la carpeta de ShareFile del cliente), **H** (`NEW VALID EMAIL`), **I** (`SENT TO VIP`), **N** (`STATUS`), **O** (`Signature`), **P** (`Notes`), **Q** (`Sales Reps`), **R** (`EMAIL`).
+    - **REGLA MAESTRA DE NOMBRE DE TIENDA, REGIÓN Y BÚSQUEDA EN SHAREFILE**:
+      * **Nombre de la Tienda (Store Name / Location)**: Se refiere y obtiene de:
+        1. Columna **E** de `UP SALES REPORT` (`LOCATION`).
+        2. Columna **K** de `MASTER SHIPPINGS` (`Location - Store`).
+        3. Columna **D** de `Customer Information - Shippings` (`STORE NAME`).
+      * **Región (Region)**: Se refiere y obtiene de:
+        - Columna **F** de `UP SALES REPORT` (`CITY` / Región).
+      * **Búsqueda en ShareFile**:
+        - Para verificar o cotejar tienda, región, fechas y productos de compra, se debe buscar **exclusivamente con el invoice proporcionado** los archivos que contienen esta información: facturas/tickets de compra (tickets Nova `_n`, `nova`, `invoice_XXXXX.jpg`) o documentos con la sección **"Purchase information"** / **"Purchase Information"**.
     - **Al responder sobre Tracking, Lectura de Filas/Celdas o Dirección vs Datos de Contacto**:
       * Si un invoice aparece en **2 o más filas** de `MASTER SHIPPINGS`, reporta **TODAS las filas encontradas** con su número de fila exacto (ej. `Fila 3975` y `Fila 4486`).
       * Cuando te pregunten por el **número de tracking**, revisa y menciona los 4 bloques de proveedores (`R`, `X`, `AD`, `AJ`), indicando la coordenada exacta de celda (ej. `AD3975`), el proveedor (ej. `STEMTOX / INTERNAL`), fechas de envío/llegada (`Shipped`/`Arrived`) y los productos de ese bloque.
-      * Separa siempre con claridad **Datos de Contacto del Cliente** (Nombre, Apellido, Teléfono, Email) vs **Dirección del Cliente** (`Address 1`, `City`, `State`, `Zip Code`, `Country`) vs **Seguimiento y Logística (Tracking)**.""",
+      * Separa siempre con claridad **Datos de Contacto del Cliente** (Nombre, Apellido, Teléfono, Email) vs **Dirección del Cliente** (`Address 1`, `City`, `State`, `Zip Code`, `Country`) vs **Seguimiento y Logística (Tracking)**.
+
+16. FORMATO OBLIGATORIO DE ENLACES A CARPETAS DE SHAREFILE (LINK LEGACY):
+    - Cuando el usuario te pregunte por el enlace o la carpeta de ShareFile de un cliente o invoice, o cuando menciones la carpeta donde se encontraron los archivos escaneados:
+    - ESTÁ ESTRICTAMENTE PROHIBIDO generar enlaces genéricos tipo `https://app.sharefile.com/fo/...` o `https://app.sharefile.com/...`.
+    - DEBES generar OBLIGATORIAMENTE el enlace legacy con el subdominio oficial de la compañía:
+      `https://morenamiabeautygroup.sharefile.com/#/folders/fo<folder_id>`
+    - Asegúrate SIEMPRE de que el ID de la carpeta en la URL empiece con el prefijo 'fo':
+      * Si el ID es `d0c2794c-8bb2-4a0b-99f5-46726f1c4e7f`, el enlace exacto es: `https://morenamiabeautygroup.sharefile.com/#/folders/fod0c2794c-8bb2-4a0b-99f5-46726f1c4e7f`
+      * Si el ID ya trae 'fo' como `fo921e25-e4d9-4fef-ae48-2a66d71bac06`, el enlace exacto es: `https://morenamiabeautygroup.sharefile.com/#/folders/fo921e25-e4d9-4fef-ae48-2a66d71bac06`
+    - Utiliza siempre el campo `sharefile_folder_url` que te devuelven directamente tus herramientas (`obtener_textos_de_archivos`, `escanear_y_rellenar_master_shippings`, `analizar_multiples_invoices_devolucion`, `buscar_y_sanitizar_cliente`)."""),
     tools=[
         diagnosticar_y_obtener_contexto_completo,
         explorar_catalogo_hojas_drive,
         obtener_sesion_activa_frontend,
         consultar_invoice_en_firestore,
+        guardar_aprendizaje,
+        listar_aprendizajes,
+        olvidar_aprendizaje,
         buscar_y_sanitizar_cliente,
         leer_fila_y_celdas_sheets,
         consultar_envios_y_motivos,
