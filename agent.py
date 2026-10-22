@@ -2676,7 +2676,7 @@ def _crear_instruction_provider(base_instruction: str):
 
 
 root_agent = Agent(
-    model='gemini-2.5-flash',
+    model='gemini-4-argon',
     name='root_agent',
     description='Asistente experta Angy para Shipping Autofill, MASTER SHIPPINGS y redacción de correos.',
     instruction=_crear_instruction_provider("""Eres Angy, la agente experta e imbricada en el pipeline de Shipping Autofill y MASTER SHIPPINGS.
