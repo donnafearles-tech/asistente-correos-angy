@@ -14,6 +14,7 @@ COPY . ./asistente_correos
 
 # Cloud Run inyecta PORT=8080 automáticamente
 ENV PORT=8080
+ENV GOOGLE_CLOUD_LOCATION=global
 
 # Iniciar el servidor web del agente ADK especificando la carpeta asistente_correos
 CMD python -m google.adk.cli web --host 0.0.0.0 --port $PORT asistente_correos

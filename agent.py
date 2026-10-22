@@ -1,6 +1,7 @@
 import os
 import requests
 os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "TRUE"
+os.environ["GOOGLE_CLOUD_LOCATION"] = "global"
 
 import json
 import urllib.request
