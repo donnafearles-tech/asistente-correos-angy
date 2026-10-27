@@ -90,7 +90,8 @@ def sanitizar_producto_devolucion(nombre: str) -> str:
     5. Información de envío y logística (Ground Free, Business Days Express Delivery, SHIP DATE)
     6. Información de transacción y pagos (Exchange Rate, TRANSACCION EN DOLARES, AFILIACION, Terminal: VS I@, BBVA)
     7. Palabras genéricas o ruido de OCR (Commerce, C-O-M-E-R-C-I-O, SSA4, RNQJ6AZMEM, NJCN6M01, Visit us at, nombres corporativos)
-    Criterios de INCLUSIÓN: Preserva nombres puros como 'HYDRA . SILK', 'ACTIVING ELIXIR', 'ATOMIC HEATING MASK', 'D.TOX Peeling', 'C.TOX Moisturizer', 'Do'r24K Milk Cleanser', 'SOLOS', 'A.TOX Syringe'.
+    Criterios de INCLUSIÓN: Preserva nombres puros como 'HYDRA . SILK', 'ACTIVING ELIXIR', 'ATOMIC HEATING MASK', 'D.TOX Peeling', 'C.TOX Moisturizer', 'Do\'r24K Milk Cleanser', 'SOLOS', 'A.TOX Syringe'.
+    Preserva la cantidad física en valor absoluto: '<CANTIDAD> <PRODUCTO>' (ej: '1 ATLAS', '2 HYDRA . SILK').
     """
     if not nombre:
         return ""
@@ -100,63 +101,115 @@ def sanitizar_producto_devolucion(nombre: str) -> str:
     if REGEX_EXCLUDE_DISCARD_LINE.search(s):
         return ""
 
+    # Pre-limpieza para detectar cantidades ignorando precios, descuentos, SKUs y números de más de 5 dígitos
+    temp = re.sub(r"[\$\€\£]\s*-?\s*\d+(?:\.\d+)?|-?\s*[\$\€\£]\s*\d+(?:\.\d+)?", " ", s)
+    temp = re.sub(r"\b\d+\s*%\s*(?:off|discount|descuento)?\b", " ", temp, flags=re.I)
+    temp = re.sub(r"\b(?:ID|SKU|UPC|REF|ITEM|CODE|COD|ART)[-:\s#]*[A-Za-z0-9_-]*\b", " ", temp, flags=re.I)
+    temp = re.sub(r"#\s*\d+\b", " ", temp)
+
+    detected_qty = 1
+    found_qty = False
+
+    # Patrón A: Paréntesis con cantidad o número: ( -2 ), ( Qty -3 ), ( Cantidad -1 ), ( 2 pcs )
+    m_paren = re.search(r"\(\s*(?:qty|cant|cantidad)?\s*[:x-]?\s*[-–—]?\s*(\d+)\s*(?:x|ea|pc|units?|unidades?|pcs)?\s*\)", temp, flags=re.I)
+    if m_paren:
+        val = int(m_paren.group(1))
+        if val > 0:
+            detected_qty = val
+            found_qty = True
+
+    # Patrón B: Número negativo explícito: -1, -2, -3, -5
+    if not found_qty:
+        m_neg = re.search(r"(?:^|[\s(])[-–—]\s*(\d+)\b", temp)
+        if m_neg:
+            val = int(m_neg.group(1))
+            if val > 0:
+                detected_qty = val
+                found_qty = True
+
+    # Patrón C: Sufijo o prefijo con palabra clave o unidad: Qty: 2, 3pcs, x2, 2x
+    if not found_qty:
+        m_suff = re.search(r"\b(?:qty|cant|cantidad)\s*[:x-]?\s*[-–—]?\s*(\d+)\b|\b(\d+)\s*(?:x|ea|pc|pcs|units?|unidades?)\b|\b(?:x)\s*(\d+)\b", temp, flags=re.I)
+        if m_suff:
+            num_str = m_suff.group(1) or m_suff.group(2) or m_suff.group(3)
+            if num_str:
+                val = int(num_str)
+                if val > 0:
+                    detected_qty = val
+                    found_qty = True
+
+    # Patrón D: Cantidad al inicio seguida de espacio y letra: '1 ATLAS', '2 HYDRA'
+    if not found_qty:
+        m_lead = re.match(r"^[+-]?\s*(\d+)\s+[A-Za-z]", temp)
+        if m_lead:
+            val = int(m_lead.group(1))
+            if val > 0:
+                detected_qty = val
+                found_qty = True
+
+    # Ahora limpiar el nombre del producto
+    cleaned = s
+
     # 1. Eliminar prefijos de archivos comunes
-    s = re.sub(r"^[A-Za-z0-9_-]+\.(?:jpe?g|png|pdf|tiff?)\s*[-–—:]*\s*", "", s, flags=re.I)
+    cleaned = re.sub(r"^[A-Za-z0-9_-]+\.(?:jpe?g|png|pdf|tiff?)\s*[-–—:]*\s*", "", cleaned, flags=re.I)
 
     # 2. Eliminar prefijos de cabeceras de devolución / retorno
-    s = re.sub(
+    cleaned = re.sub(
         r"^(?:returned\s+items?|refunded\s+items?|return\s+items?|productos?\s+devueltos?|items?\s+retornados?|returned|refunded|return|refund|devoluci[oó]n|retorno|void|exchange|cambio)\s*[:–—-]*\s*",
         "",
-        s,
+        cleaned,
         flags=re.I
     )
 
     # 3. Eliminar paréntesis con signo negativo, precios o cantidades
-    s = re.sub(r"\(\s*-\s*\$?\s*\d+(?:\.\d+)?\s*\)", "", s)
-    s = re.sub(r"\(\s*\$?\s*\d+(?:\.\d+)?\s*-\s*\)", "", s)
-    s = re.sub(r"\(\s*-\s*\d+\s*(?:x|ea|pc|units?|unidades?|pcs)?\s*\)", "", s, flags=re.I)
-    s = re.sub(r"\(\s*(?:qty|cant|cantidad|retornar|retorno)\s*[:x-]?\s*-?\d+[^)]*\)", "", s, flags=re.I)
-    s = re.sub(r"\(\s*cantidad\s*-\s*\d+[^)]*\)", "", s, flags=re.I)
+    cleaned = re.sub(r"\(\s*-\s*\$?\s*\d+(?:\.\d+)?\s*\)", "", cleaned)
+    cleaned = re.sub(r"\(\s*\$?\s*\d+(?:\.\d+)?\s*-\s*\)", "", cleaned)
+    cleaned = re.sub(r"\(\s*-\s*\d+\s*(?:x|ea|pc|units?|unidades?|pcs)?\s*\)", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\(\s*(?:qty|cant|cantidad|retornar|retorno)\s*[:x-]?\s*-?\d+[^)]*\)", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\(\s*cantidad\s*-\s*\d+[^)]*\)", "", cleaned, flags=re.I)
 
     # 4. Eliminar importes y precios negativos o positivos y porcentajes de descuento
-    s = re.sub(r"-\s*\$\s*\d+(?:\.\d+)?", "", s)
-    s = re.sub(r"\$\s*-\s*\d+(?:\.\d+)?", "", s)
-    s = re.sub(r"\$\s*\d+(?:\.\d+)?", "", s)
-    s = re.sub(r"\b\d+\s*%\s*(?:off|discount|descuento)?\b", "", s, flags=re.I)
-    s = re.sub(r"\b\d+\.\d{2}\b", "", s)
+    cleaned = re.sub(r"-\s*\$\s*\d+(?:\.\d+)?", "", cleaned)
+    cleaned = re.sub(r"\$\s*-\s*\d+(?:\.\d+)?", "", cleaned)
+    cleaned = re.sub(r"\$\s*\d+(?:\.\d+)?", "", cleaned)
+    cleaned = re.sub(r"\b\d+\s*%\s*(?:off|discount|descuento)?\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b\d+\.\d{2}\b", "", cleaned)
 
     # 5. Eliminar cantidades y unidades negativas o normales al inicio/final
-    s = re.sub(r"^[+-]?\s*\d*\s*(?:x|ea|pc|units?|unidades?|pcs)\s*", "", s, flags=re.I)
-    s = re.sub(r"^[+-]\s*\d+\s*", "", s)
-    s = re.sub(r"\b(?:qty|cant|cantidad|retornar|retorno)\s*[:x-]?\s*-?\d+\b", "", s, flags=re.I)
-    s = re.sub(r"[-–—]\s*\d+\s*(?:x|ea|pc|units?|unidades?|pcs)?\s*$", "", s, flags=re.I)
-    s = re.sub(r"\b\d+\s*(?:pcs|pc|ea|units?|unidades?)\b", "", s, flags=re.I)
+    cleaned = re.sub(r"^[+-]?\s*\d*\s*(?:x|ea|pc|units?|unidades?|pcs)\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^[+-]\s*\d+\s*", "", cleaned)
+    cleaned = re.sub(r"^[+-]?\s*\d+\s+(?=[A-Za-z])", "", cleaned)
+    cleaned = re.sub(r"\b(?:qty|cant|cantidad|retornar|retorno)\s*[:x-]?\s*-?\d+[^)]*\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"[-–—]\s*\d+\s*(?:x|ea|pc|units?|unidades?|pcs)?\s*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\b[xX]\s*\d+\s*$", "", cleaned)
+    cleaned = re.sub(r"\b\d+\s*[xX]\s*$", "", cleaned)
+    cleaned = re.sub(r"\b\d+\s*(?:pcs|pc|ea|units?|unidades?)\b", "", cleaned, flags=re.I)
 
     # 6. Eliminar totales, subtotales, impuestos y balance
-    s = re.sub(r"\b(?:price|precio|total|subtotal|sub-total|amount|tax|balance\s*due)\b[^\n]*", "", s, flags=re.I)
+    cleaned = re.sub(r"\b(?:price|precio|total|subtotal|sub-total|amount|tax|balance\s*due)\b[^\n]*", "", cleaned, flags=re.I)
 
     # 7. Eliminar IDs, SKUs, UPCs, códigos de barras y referencias numéricas
-    s = re.sub(r"\b(?:ID|SKU|UPC|REF|ITEM|CODE|COD|ART)[-:\s#]*[A-Za-z0-9_-]*\b", "", s, flags=re.I)
-    s = re.sub(r"#\s*\d+\b", "", s)
-    s = re.sub(r"\b\d{6,}\b", "", s)
+    cleaned = re.sub(r"\b(?:ID|SKU|UPC|REF|ITEM|CODE|COD|ART)[-:\s#]*[A-Za-z0-9_-]*\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"#\s*\d+\b", "", cleaned)
+    cleaned = re.sub(r"\b\d{6,}\b", "", cleaned)
 
     # 8. Eliminar cualquier otro paréntesis residual vacío o con números
-    s = re.sub(r"\(\s*\)", "", s)
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
 
     # 9. Limpiar símbolos y signos al inicio y al final (preservando puntos o símbolos internos como 'HYDRA . SILK')
-    s = re.sub(r"^[+-/*•±\\–—\s\"'`.:;|,]+", "", s)
-    s = re.sub(r"[+-/*•±\\–—\s\"'`.:;|,]+$", "", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    cleaned = re.sub(r"^[+-/*•±\\–—\s\"'`.:;|,]+", "", cleaned)
+    cleaned = re.sub(r"[+-/*•±\\–—\s\"'`.:;|,]+$", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
     # 10. Descarte final si coincide con palabras inválidas, es demasiado corta o no tiene letras
-    if len(s) < 3 or s.lower() in PALABRAS_INVALIDAS_DEVOLUCION or not re.search(r"[a-zA-Z]", s):
+    if len(cleaned) < 3 or cleaned.lower() in PALABRAS_INVALIDAS_DEVOLUCION or not re.search(r"[a-zA-Z]", cleaned):
         return ""
 
     # 11. Descarte si lo que queda activa el regex de exclusión
-    if REGEX_EXCLUDE_DISCARD_LINE.search(s):
+    if REGEX_EXCLUDE_DISCARD_LINE.search(cleaned):
         return ""
 
-    return s
+    return f"{detected_qty} {cleaned}"
 
 
 def extraer_productos_negativos_o_devolucion_de_texto(texto: str, es_documento_retorno: bool = False) -> list[str]:
