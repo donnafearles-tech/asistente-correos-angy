@@ -19,13 +19,14 @@ COMPANY_PHONES = {"8882494189", "18882494189"}
 
 import re
 
-REGEX_VIP = re.compile(r"(?:^|[\s_-])(?:v|vip)(?:[\s_.-]|$)", re.IGNORECASE)
+REGEX_VIP = re.compile(r"(?:^|[\s_-])vip(?:[\s_.-]|$)", re.IGNORECASE)
 REGEX_SHIPPING = re.compile(r"shippin(?:g)?(?:\s*form)?", re.IGNORECASE)
 REGEX_PURCHASE_INFO = re.compile(r"purchase\s+inf[o0]rmati[o0]n", re.IGNORECASE)
 REGEX_TICKET_NOVA = re.compile(r"(?:_(?:n|nov)\b|[\s_-]n\.jpe?g$|\bnova\b|\binvoice[\s_-]*\d{4,6}\.jpe?g$)", re.IGNORECASE)
 REGEX_ID = re.compile(r"(?:^|[\s_-])(?:id|pass|passport|pp|dl|license)(?:[\s_.-]|$)", re.IGNORECASE)
-REGEX_EXCLUDED = re.compile(r"(?:gbk|5cc|50c|ccid|(?<![a-z])cid(?![a-z]))", re.IGNORECASE)
+REGEX_EXCLUDED = re.compile(r"(?:gbk|5cc|50c|ccid|(?<![a-z])cid(?![a-z])|e[\s_.-]?transfer|transfer|(?:^|[_\s.-])v(?:\s*\(\d+\)|\s*\d+)?\.(?:jpe?g|png|webp)$)", re.IGNORECASE)
 REGEX_RETURN = re.compile(r"(?:^|[_\s.-])(?:r|ret|returns?|refunds?|devoluci[oó]n)(?:[_\s.-]\d*|\d+|$)", re.IGNORECASE)
+REGEX_N_SHIPPING = re.compile(r"(?:^|[_\s.-])n[\s_-]*shipping", re.IGNORECASE)
 
 
 REGEX_EXCLUDE_DISCARD_LINE = re.compile(
@@ -255,14 +256,14 @@ def clasificar_archivo_nomenclatura(file_name: str, text: str = "", is_letter_si
     has_purchase_info = bool(REGEX_PURCHASE_INFO.search(raw_text))
     letter_ok = True if is_letter_size is None else bool(is_letter_size)
     is_purchase_info_shipping_doc = has_purchase_info and letter_ok
-    is_return_doc = bool(REGEX_RETURN.search(fname)) or fname.lower().endswith("_r.jpg") or fname.lower().endswith("-r.jpg")
+    is_return_doc = bool(REGEX_RETURN.search(fname)) or fname.lower().endswith("_r.jpg") or fname.lower().endswith("-r.jpg") or bool(REGEX_N_SHIPPING.search(fname))
 
     if REGEX_EXCLUDED.search(fname):
-        categoria = "EXCLUIDO_EMPRESA_DEUDOR (GBK/5CC/50C/CID)"
+        categoria = "EXCLUIDO_EMPRESA_DEUDOR (GBK/5CC/50C/CID/V/E.TRANSFER)"
     elif is_return_doc:
         categoria = "DEVOLUCION_RETURN (_R / RETURN)"
     elif REGEX_VIP.search(fname) or "vip" in fname.lower():
-        categoria = "VIP_FORM (_V / VIP)"
+        categoria = "VIP_FORM (VIP)"
     elif REGEX_SHIPPING.search(fname):
         categoria = "SHIPPING_FORM (Nombre estándar)"
     elif is_purchase_info_shipping_doc:
@@ -2326,8 +2327,8 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
                             invoices_descubiertos_en_carpeta.append(f_m)
 
                 clasif = clasificar_archivo_nomenclatura(fname, ftext)
-                es_retorno = clasif.get("isReturnDocument", False) or f.get("classifiedType") == "return" or bool(REGEX_RETURN.search(fname)) or fname.lower().endswith("_r.jpg") or fname.lower().endswith("-r.jpg")
-                es_vip = clasif.get("categoria") == "VIP_FORM (_V / VIP)" or "vip" in fname.lower() or bool(REGEX_VIP.search(fname))
+                es_retorno = clasif.get("isReturnDocument", False) or f.get("classifiedType") == "return" or bool(REGEX_RETURN.search(fname)) or fname.lower().endswith("_r.jpg") or fname.lower().endswith("-r.jpg") or bool(REGEX_N_SHIPPING.search(fname))
+                es_vip = clasif.get("categoria") == "VIP_FORM (VIP)" or "vip" in fname.lower() or bool(REGEX_VIP.search(fname))
                 if es_retorno:
                     tiene_archivo_retorno = True
 
