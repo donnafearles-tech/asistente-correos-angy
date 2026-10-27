@@ -2328,13 +2328,14 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
 
                 clasif = clasificar_archivo_nomenclatura(fname, ftext)
                 es_retorno = clasif.get("isReturnDocument", False) or f.get("classifiedType") == "return" or bool(REGEX_RETURN.search(fname)) or fname.lower().endswith("_r.jpg") or fname.lower().endswith("-r.jpg") or bool(REGEX_N_SHIPPING.search(fname))
-                es_vip = clasif.get("categoria") == "VIP_FORM (VIP)" or "vip" in fname.lower() or bool(REGEX_VIP.search(fname))
+                es_vip = clasif.get("categoria") == "VIP_FORM (VIP)" or f.get("classifiedType") == "vip" or "vip" in fname.lower() or bool(REGEX_VIP.search(fname))
+                es_excluido = clasif.get("categoria") == "EXCLUDED" or bool(REGEX_EXCLUDED.search(fname)) or bool(re.search(r"(?:^|[_\s.-])v(?:\.jpe?g|\.png)?$", fname, re.IGNORECASE))
                 if es_retorno:
                     tiene_archivo_retorno = True
 
                 # Detección exhaustiva de productos devueltos / negativos sobre el texto OCR completo
                 # NOTA CRÍTICA: Se omiten estrictamente archivos como _V.jpg y VIP.jpg para la Columna M de MASTER SHIPPINGS
-                if not es_vip:
+                if not es_vip and not es_excluido:
                     prods_extraidos = extraer_productos_negativos_o_devolucion_de_texto(ftext, es_documento_retorno=es_retorno)
                     for p_ext in prods_extraidos:
                         if p_ext and len(p_ext) >= 3:
@@ -2403,50 +2404,106 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
         # Sanitizar y deduplicar productos de retorno
         prods_sanitizados = list(dict.fromkeys([p for p in raw_negative_products if p and len(p) >= 3]))
 
+        # Extraer monto total monetario del invoice para identificar compra mayor (compra grande)
+        total_inv_str = ""
+        ext = scan_res.get("extractedData") or scan_res.get("extraidos") or scan_res.get("data") or {}
+        if ext.get("total"):
+            total_inv_str = str(ext.get("total"))
+        if not total_inv_str:
+            for f in scan_res.get("files") or []:
+                ftxt = f.get("text") or f.get("fullText") or ""
+                m_tot = re.search(r"\bTotal:?\s*\$?\s*([\d,]+\.\d{2})", ftxt, re.IGNORECASE)
+                if m_tot:
+                    total_inv_str = f"${m_tot.group(1)}"
+                    break
+        if not total_inv_str:
+            try:
+                url_rec = f"{BACKEND_URL}/api/sheets/record-by-invoice?invoice={urllib.parse.quote(inv)}"
+                req_rec = urllib.request.Request(url_rec, headers={"User-Agent": "AngyAgent/1.0"})
+                with urllib.request.urlopen(req_rec, timeout=5) as r_rec:
+                    data_rec = json.loads(r_rec.read().decode('utf-8'))
+                    if data_rec.get("success") and data_rec.get("record"):
+                        raw_tot = data_rec["record"].get("total", "")
+                        raw_inv_col = data_rec["record"].get("invoice", "")
+                        inv_toks = [re.sub(r"^mm-?", "", t.strip(), flags=re.IGNORECASE).lower() for t in re.split(r"[\r\n,;\s]+", str(raw_inv_col)) if t.strip()]
+                        tot_toks = [t.strip() for t in str(raw_tot).splitlines() if t.strip()]
+                        clean_this_inv = re.sub(r"^mm-?", "", str(inv).strip(), flags=re.IGNORECASE).lower()
+                        if clean_this_inv in inv_toks:
+                            pos = inv_toks.index(clean_this_inv)
+                            if pos < len(tot_toks):
+                                total_inv_str = tot_toks[pos]
+                        if not total_inv_str and tot_toks:
+                            total_inv_str = tot_toks[0]
+            except Exception:
+                pass
+
+        monto_num = 0.0
+        if total_inv_str:
+            cleaned_m = re.sub(r"[^0-9.-]", "", total_inv_str.splitlines()[0] if total_inv_str else "")
+            try:
+                monto_num = float(cleaned_m)
+            except Exception:
+                monto_num = 0.0
+
         es_candidato_master = tiene_archivo_retorno or len(prods_sanitizados) > 0
-        if es_candidato_master and not invoice_devolucion_seleccionada:
-            invoice_devolucion_seleccionada = inv
-            productos_devueltos_sanitizados = prods_sanitizados
 
         resultados_invoices.append({
             "invoice": inv,
+            "monto_total_str": total_inv_str,
+            "monto_total": monto_num,
             "tiene_archivo_retorno_r": tiene_archivo_retorno,
             "productos_negativos_detectados_sanitizados": prods_sanitizados,
             "debe_ir_a_master_shippings": es_candidato_master,
             "archivos": archivos_detectados
         })
 
-    # REGLA PRIORITARIA ABSOLUTA DEL INVOICE DE DEVOLUCIÓN:
-    # Si algún archivo de devolución contiene en su nombre un número de invoice específico (ej. "233145_R.jpg" -> "233145"),
-    # ESE es el invoice que tiene prioridad absoluta para MASTER SHIPPINGS, aunque no haya sido proporcionado inicialmente.
+    # 1. Identificar la COMPRA MAYOR (Factura con mayor cantidad de dinero/total positivo)
+    invoice_compra_grande = None
+    max_monto = -float("inf")
+    for r in resultados_invoices:
+        m = r.get("monto_total", 0.0)
+        if m > max_monto:
+            max_monto = m
+            invoice_compra_grande = r["invoice"]
+    if not invoice_compra_grande and resultados_invoices:
+        invoice_compra_grande = resultados_invoices[0]["invoice"]
+
+    # 2. Identificar el INVOICE DE RETORNO / DEVOLUCIÓN (_R, RETURN, N SHIPPING o negativos -)
+    invoice_con_retorno = None
     for af in todos_los_archivos_carpeta:
         if af.get("es_devolucion"):
             matches = re.findall(r"(?:^|[_\s-])(\d{5,8})(?:[_\s.-]|$)", af.get("nombre", ""))
             if matches:
-                invoice_ret_nom = matches[0]
-                invoice_devolucion_seleccionada = invoice_ret_nom
-                # Si ese invoice ya tenía productos sanitizados, usarlos; de lo contrario mantener los productos negativos encontrados
+                invoice_con_retorno = matches[0]
                 for r in resultados_invoices:
-                    if r["invoice"] == invoice_ret_nom and r.get("productos_negativos_detectados_sanitizados"):
+                    if r["invoice"] == invoice_con_retorno and r.get("productos_negativos_detectados_sanitizados"):
                         productos_devueltos_sanitizados = r["productos_negativos_detectados_sanitizados"]
                         break
                 break
 
-    # Si se detectó un invoice de retorno entre los archivos pero no coincidía con el invoice iterado
-    if not invoice_devolucion_seleccionada:
+    if not invoice_con_retorno:
         for r in resultados_invoices:
             if r.get("tiene_archivo_retorno_r") or len(r.get("productos_negativos_detectados_sanitizados", [])) > 0:
-                invoice_devolucion_seleccionada = r["invoice"]
-                productos_devueltos_sanitizados = r["productos_negativos_detectados_sanitizados"]
+                invoice_con_retorno = r["invoice"]
+                if not productos_devueltos_sanitizados:
+                    productos_devueltos_sanitizados = r.get("productos_negativos_detectados_sanitizados", [])
                 break
 
-    # Actualizar marcas de debe_ir_a_master_shippings para reflejar el ganador absoluto
-    if invoice_devolucion_seleccionada:
-        for r in resultados_invoices:
-            r["debe_ir_a_master_shippings"] = (r["invoice"] == invoice_devolucion_seleccionada)
-
-    hay_devolucion = bool(invoice_devolucion_seleccionada)
+    # REGLA MAESTRA DE NEGOCIO N:1 PARA MASTER SHIPPINGS:
+    # Columna E (NOVA INVOICE): Siempre es la factura de la COMPRA MAYOR (la grande).
+    # Columna M (PRODUCTS): Productos de retorno correspondientes (_R, RETURN, N SHIPPING o negativos -).
+    # Si NO hay ticket de retorno: se emite alerta/toast y se selecciona igualmente la compra mayor.
+    invoice_seleccionado_para_master = invoice_compra_grande
+    hay_devolucion = bool(invoice_con_retorno or len(productos_devueltos_sanitizados) > 0)
     hay_productos_sanitizables = len(productos_devueltos_sanitizados) > 0
+
+    alerta_sin_retorno = None
+    if not hay_devolucion:
+        alerta_sin_retorno = f"Advertencia: No se encontraron tickets de retorno (_R.jpg, RETURN.jpg, N SHIPPING.jpg). Se seleccionó la factura de compra mayor [{invoice_compra_grande}]."
+
+    for r in resultados_invoices:
+        r["debe_ir_a_master_shippings"] = (r["invoice"] == invoice_seleccionado_para_master)
+        r["es_compra_mayor"] = (r["invoice"] == invoice_compra_grande)
 
     # Clasificar archivos de la carpeta ganadora
     tiene_shipping_file = False
@@ -2469,6 +2526,8 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
             if acat == "id" or "_id" in aname or "license" in aname or "passport" in aname:
                 tiene_id_file = True
 
+    carpeta_ganadora_nom = invoice_con_retorno or invoice_compra_grande or (invoices_iniciales[0] if invoices_iniciales else "")
+
     return {
         "relacion": "N:1 (Varios Invoices pertenecen a 1 Cliente)",
         "invoices_solicitados": invoices_iniciales,
@@ -2476,9 +2535,11 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
         "total_invoices_analizados": len(resultados_invoices),
         "hay_devolucion": hay_devolucion,
         "hay_productos_sanitizables": hay_productos_sanitizables,
-        "invoice_seleccionado_para_master_shippings": invoice_devolucion_seleccionada,
-        "invoice_con_devolucion": invoice_devolucion_seleccionada,
-        "carpeta_ganadora": invoice_devolucion_seleccionada or (invoices_iniciales[0] if invoices_iniciales else ""),
+        "invoice_compra_mayor": invoice_compra_grande,
+        "invoice_seleccionado_para_master_shippings": invoice_seleccionado_para_master,
+        "invoice_con_devolucion": invoice_con_retorno,
+        "alerta_sin_retorno": alerta_sin_retorno,
+        "carpeta_ganadora": carpeta_ganadora_nom,
         "archivos_carpeta_ganadora": archivos_carpeta_ganadora,
         "sharefile_folder_url": carpeta_ganadora_folder_url,
         "tiene_shipping_en_carpeta_ganadora": tiene_shipping_file,
@@ -2487,13 +2548,12 @@ def analizar_multiples_invoices_devolucion(invoices: list[str]) -> dict:
         "productos_devueltos_sanitizados": productos_devueltos_sanitizados,
         "productos_devueltos_sanitizados_para_columna_m": productos_devueltos_sanitizados,
         "regla_aplicada": (
-            f"Se analizaron {len(resultados_invoices)} facturas de la carpeta ganadora (solicitadas: {', '.join(invoices_iniciales)}"
-            + (f"; adicionales descubiertas: {', '.join(invoices_descubiertos_en_carpeta)}" if invoices_descubiertos_en_carpeta else "")
-            + f"). Solo la factura con devolución/saldo negativo '{invoice_devolucion_seleccionada}' se envía a MASTER SHIPPINGS con productos sanitizados "
-            f"({', '.join(productos_devueltos_sanitizados) if hay_productos_sanitizables else 'sin productos específicos sanitizables'}). "
-            f"Todos los archivos de la carpeta ({len(archivos_carpeta_ganadora)} archivos) se procesan con la misma importancia (VIP, Shipping, ID y Devolución). "
-            f"Las demás facturas se registran únicamente en Customer Information."
-        ) if hay_devolucion else f"Se analizaron {len(resultados_invoices)} facturas ({', '.join(invoices_a_procesar)}). Ninguna presenta archivos de devolución (_R.jpg) ni saldos negativos.",
+            f"Relación N:1 con devolución. Se seleccionó la factura de la COMPRA MAYOR [{invoice_compra_grande}] (${max_monto:,.2f}) para Columna E (NOVA INVOICE) en MASTER SHIPPINGS, "
+            f"y los productos de devolución correspondientes ({', '.join(productos_devueltos_sanitizados) if hay_productos_sanitizables else 'sin productos específicos'}) tomados de '{invoice_con_retorno}' para Columna M. "
+            f"Las demás facturas van únicamente a Customer Information."
+        ) if hay_devolucion else (
+            f"Advertencia: No se encontraron tickets de retorno (_R.jpg, RETURN.jpg, N SHIPPING.jpg). Se seleccionó la factura de compra mayor [{invoice_compra_grande}]."
+        ),
         "detalle_por_invoice": resultados_invoices
     }
 
