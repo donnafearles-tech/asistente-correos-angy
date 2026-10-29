@@ -2042,9 +2042,9 @@ def escanear_y_rellenar_master_shippings(invoice: str, guardar_en_sheets: bool =
             return_prods_str = "\n".join(return_prods) if isinstance(return_prods, list) else (str(return_prods) if return_prods else None)
             upd_res = actualizar_registro_sheets(
                 invoice=str(invoice).strip(),
-                nombre=extracted.get("name"),
-                apellido=extracted.get("lastName"),
-                telefono=extracted.get("phone"),
+                nombre=extracted.get("shippingName") or extracted.get("name"),
+                apellido=extracted.get("shippingLastName") if extracted.get("shippingName") else extracted.get("lastName"),
+                telefono=extracted.get("telephone") or extracted.get("phone"),
                 email=extracted.get("email"),
                 direccion=extracted.get("address"),
                 ciudad=extracted.get("city"),
@@ -2076,6 +2076,69 @@ def escanear_y_rellenar_master_shippings(invoice: str, guardar_en_sheets: bool =
         }
     except Exception as e:
         return {"error": f"Error en escanear_y_rellenar_master_shippings: {str(e)}"}
+
+
+def enviar_payload_master_shippings(
+    nova_invoice_compra_mayor: str,
+    nombre_completo_shipping: str,
+    telefono_10_digitos: str = "",
+    email: str = "",
+    direccion_calle: str = "",
+    ciudad: str = "",
+    estado: str = "",
+    codigo_postal: str = "",
+    pais_can_usa_mex: str = "",
+    tienda_store: str = "",
+    vendedor_sales_rep: str = "",
+    fecha_venta: str = "",
+    productos_devueltos_sanitizados: str = "",
+) -> dict:
+    """
+    Construye y despacha directamente el payload exclusivo de MASTER SHIPPINGS (Hoja 2: 1Exv3SLMgUrWCpYYV5QgNMsYDTCKi1AgOeqONuOe-nFY)
+    a través del endpoint '/api/master-shippings/payload', aplicando las reglas estrictas:
+    - Columna C (Customer Full Name): Nombre extraído de SHIPPING.jpg, SHIPPING FORM.jpg o documento con 'PURCHASE INFORMATION' (VIP NUNCA sobrescribe este nombre).
+    - Columna D (Phone #): Teléfono sanitizado de 10 dígitos (excluyendo el corporativo 8882494189).
+    - Columna E (NOVA INVOICE): Factura de la COMPRA MAYOR en relaciones N:1.
+    - Columnas F, G, H, I: Address 1 (Street), City, State, Zip Code.
+    - Columna J (Country): Normalizado a 'CAN', 'USA' o 'MEX' (priorizando país explícito del documento Shipping / Purchase Information).
+    - Columna K (Location - Store): Tienda validada contra STORE_LIST.
+    - Columna L (Sales rep): Vendedor.
+    - Columna M (Products): Exclusivamente productos devueltos (_R.jpg, RETURN.jpg, N SHIPPING.jpg o negativos '-') sanitizados con cantidades en valor absoluto.
+    """
+    clean_phone = "".join(filter(str.isdigit, str(telefono_10_digitos or "")))
+    if len(clean_phone) > 10:
+        clean_phone = clean_phone[-10:]
+    if clean_phone in COMPANY_PHONES:
+        return {"error": "No se puede enviar a MASTER SHIPPINGS: El teléfono corresponde al número corporativo de la empresa (8882494189)."}
+
+    payload = {
+        "A": str(fecha_venta or "").strip(),
+        "B": str(email or "").strip().lower(),
+        "C": str(nombre_completo_shipping or "").strip(),
+        "D": clean_phone,
+        "E": str(nova_invoice_compra_mayor or "").strip(),
+        "F": str(direccion_calle or "").strip(),
+        "G": str(ciudad or "").strip(),
+        "H": str(estado or "").strip(),
+        "I": str(codigo_postal or "").strip(),
+        "J": str(pais_can_usa_mex or "").strip().upper(),
+        "K": str(tienda_store or "").strip(),
+        "L": str(vendedor_sales_rep or "").strip(),
+        "M": str(productos_devueltos_sanitizados or "").strip(),
+    }
+
+    url = f"{BACKEND_URL}/api/master-shippings/payload"
+    try:
+        response = requests.post(url, json=payload, timeout=25)
+        if response.status_code == 200:
+            return {
+                "success": True,
+                "payload_enviado": payload,
+                "respuesta_sheets": response.json(),
+            }
+        return {"error": f"Error al enviar payload a MASTER SHIPPINGS ({response.status_code}): {response.text}"}
+    except Exception as e:
+        return {"error": f"Error de conexión con '/api/master-shippings/payload': {str(e)}"}
 
 
 def actualizar_registro_sheets(
@@ -2992,6 +3055,7 @@ Incluye SOLO los campos que el usuario quiere modificar.
         sincronizar_usuario_con_zendesk,
         obtener_textos_de_archivos,
         escanear_y_rellenar_master_shippings,
+        enviar_payload_master_shippings,
         actualizar_registro_sheets,
         buscar_clientes,
         validar_correo,
