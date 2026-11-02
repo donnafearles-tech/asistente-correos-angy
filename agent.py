@@ -2021,7 +2021,8 @@ def escanear_y_rellenar_master_shippings(invoice: str, guardar_en_sheets: bool =
     2. MEDICIÓN DE INFERENCIA DE IA (Vertex/Gemini OCR + detección de la frase 'Purchase information' cuando un humano renombró mal el archivo shipping.jpg)
     3. MEDICIÓN DE ESCRITURA EN DB (Firestore)
     Extrae con prioridad:
-    - 'Address 1 (Street)', 'City', 'Sales rep' y 'Country' desde el archivo Shipping o el archivo Tamaño Carta que contenga 'Purchase information'.
+    - 'Address 1 (Street)', 'City', 'State' (Columna H), 'Zip Code' (Columna I), 'Sales rep' y 'Country' exclusivamente desde el archivo 'SHIPPING.JPG', 'SHIPPING FORM.JPG' o el archivo Tamaño Carta que contenga 'PURCHASE INFORMATION' en sus datos binarios/texto.
+    - REGLA ESTRICTA DE ESTADO Y CÓDIGO POSTAL EN MASTER SHIPPINGS: En MASTER SHIPPINGS, 'State' (Columna H) y 'Zip Code' (Columna I) provienen EXCLUSIVAMENTE de 'SHIPPING.JPG', 'SHIPPING FORM.JPG' o del documento Tamaño Carta con 'PURCHASE INFORMATION' (NUNCA de archivos VIP ni por inferencia telefónica). Si el estado no se encuentra en dichos documentos, se deja vacío y se agrega la nota de celda 'no se encontro el estado' en la Columna H.
     - REGLA DE PAÍS: El 'Country' extraído explícitamente de este documento tiene PRIORIDAD ABSOLUTA sobre la deducción por número de teléfono.
     - DEVOLUCIONES: Detecta archivos de devolución (R.jpg, RETURN.jpg, etc.) y saldos negativos para enviarlos a la Columna M de MASTER SHIPPINGS.
     Si guardar_en_sheets=True, escribe además los datos en MASTER SHIPPINGS y Customer Information (creando la fila si no existe).
@@ -2048,8 +2049,8 @@ def escanear_y_rellenar_master_shippings(invoice: str, guardar_en_sheets: bool =
                 email=extracted.get("email"),
                 direccion=extracted.get("address"),
                 ciudad=extracted.get("city"),
-                region=extracted.get("state"),
-                zipCode=extracted.get("zipCode"),
+                region=extracted.get("shippingState") if "shippingState" in extracted else extracted.get("state"),
+                zipCode=extracted.get("shippingZipCode") if "shippingZipCode" in extracted else extracted.get("zipCode"),
                 pais=extracted.get("country"),
                 fecha_venta=extracted.get("saleDate"),
                 vendedor=extracted.get("salesRep"),
@@ -2100,6 +2101,8 @@ def enviar_payload_master_shippings(
     - Columna D (Phone #): Teléfono sanitizado de 10 dígitos (excluyendo el corporativo 8882494189).
     - Columna E (NOVA INVOICE): Factura de la COMPRA MAYOR en relaciones N:1.
     - Columnas F, G, H, I: Address 1 (Street), City, State, Zip Code.
+      * REGLA TAREA 1 (Zip Code, Columna I): Debe ser EXCLUSIVAMENTE el que se encuentre en 'SHIPPING.JPG', 'SHIPPING FORM.JPG' o el documento tamaño carta que contenga 'PURCHASE INFORMATION' en sus datos binarios/texto.
+      * REGLA TAREA 2 (State, Columna H): Debe ser EXCLUSIVAMENTE el de 'SHIPPING.JPG', 'SHIPPING FORM.JPG' o el documento tamaño carta con 'PURCHASE INFORMATION'. Cuando esta información no se encuentre en dichos documentos, se deja vacío y se coloca el comentario/nota en la celda correspondiente: 'no se encontro el estado'.
     - Columna J (Country): Normalizado a 'CAN', 'USA' o 'MEX' (priorizando país explícito del documento Shipping / Purchase Information).
     - Columna K (Location - Store): Tienda validada contra STORE_LIST.
     - Columna L (Sales rep): Vendedor.
@@ -2111,6 +2114,10 @@ def enviar_payload_master_shippings(
     if clean_phone in COMPANY_PHONES:
         return {"error": "No se puede enviar a MASTER SHIPPINGS: El teléfono corresponde al número corporativo de la empresa (8882494189)."}
 
+    clean_state = str(estado or "").strip()
+    clean_zip = str(codigo_postal or "").strip()
+    state_note = None if clean_state else "no se encontro el estado"
+
     payload = {
         "A": str(fecha_venta or "").strip(),
         "B": str(email or "").strip().lower(),
@@ -2119,12 +2126,15 @@ def enviar_payload_master_shippings(
         "E": str(nova_invoice_compra_mayor or "").strip(),
         "F": str(direccion_calle or "").strip(),
         "G": str(ciudad or "").strip(),
-        "H": str(estado or "").strip(),
-        "I": str(codigo_postal or "").strip(),
+        "H": clean_state,
+        "I": clean_zip,
         "J": str(pais_can_usa_mex or "").strip().upper(),
         "K": str(tienda_store or "").strip(),
         "L": str(vendedor_sales_rep or "").strip(),
         "M": str(productos_devueltos_sanitizados or "").strip(),
+        "shippingState": clean_state,
+        "shippingZipCode": clean_zip,
+        "stateNote": state_note,
     }
 
     url = f"{BACKEND_URL}/api/master-shippings/payload"
@@ -2210,8 +2220,15 @@ def actualizar_registro_sheets(
     if productos_devueltos is not None: extraction_data["returnProducts"] = str(productos_devueltos).strip()
     if direccion is not None: extraction_data["address"] = str(direccion).strip()
     if ciudad is not None: extraction_data["city"] = str(ciudad).strip()
-    if region is not None: extraction_data["state"] = str(region).strip()
-    if zipCode is not None: extraction_data["zipCode"] = str(zipCode).strip()
+    if region is not None:
+        clean_reg = str(region).strip()
+        extraction_data["state"] = clean_reg
+        extraction_data["shippingState"] = clean_reg
+        extraction_data["stateNote"] = None if clean_reg else "no se encontro el estado"
+    if zipCode is not None:
+        clean_zp = str(zipCode).strip()
+        extraction_data["zipCode"] = clean_zp
+        extraction_data["shippingZipCode"] = clean_zp
     if pais is not None: extraction_data["country"] = str(pais).strip()
     if fecha_venta is not None: extraction_data["saleDate"] = str(fecha_venta).strip()
     if vendedor is not None: extraction_data["salesRep"] = str(vendedor).strip()
@@ -2877,7 +2894,9 @@ Sigue estrictamente estas reglas al responder preguntas, procesar archivos o uti
 
 2. REGLAS OFICIALES DE NOMENCLATURA REGEX:
    - **VIP (`_V`, `VIP`)**: Fuente #1 de verdad para **Email** y **Teléfono** del cliente.
-   - **SHIPPING (`shipping.jpg`, `shipping form.jpg`) o Documento Tamaño Carta con `"Purchase information"`**: Fuente #1 de verdad para extraer **`Address 1 (Street)`**, **`City`**, **`Sales rep`** y **`Country`**.
+   - **SHIPPING (`shipping.jpg`, `shipping form.jpg`) o Documento Tamaño Carta con `"Purchase information"`**: Fuente #1 y EXCLUSIVA de verdad en **MASTER SHIPPINGS** para extraer **`Address 1 (Street)`**, **`City`**, **`State` (Columna H)**, **`Zip Code` (Columna I)**, **`Sales rep`** y **`Country`**.
+     * **REGLA ESTRICTA DE `Zip Code` Y `State` EN MASTER SHIPPINGS**: El `Zip Code` (Columna I) y el `State` (Columna H) en **MASTER SHIPPINGS** deben ser **EXCLUSIVAMENTE** los que se encuentren en `"SHIPPING.JPG"`, `"SHIPPING FORM.JPG"` o en el documento tamaño carta que contenga `"PURCHASE INFORMATION"` en sus datos binarios/texto (jamás se toman del VIP ni se deducen del código de área telefónico).
+     * **NOTA DE CELDA CUANDO FALTA EL ESTADO**: Cuando el `State` no se encuentre en `"SHIPPING.JPG"`, `"SHIPPING FORM.JPG"` ni en el documento tamaño carta con `"PURCHASE INFORMATION"`, la celda de la Columna H se deja vacía y se coloca el comentario/nota en la celda correspondiente: **`"no se encontro el estado"`**.
    - **DEVOLUCIÓN (`_R.jpg`, `R.jpg`, `RETURN.jpg`, `_r.jpg`)**: Archivos de retorno/reembolso para **MASTER SHIPPINGS**.
    - **PRIORIDAD ESTRICTA DE `Country`**: El `Country` extraído explícitamente del documento Shipping / `"Purchase information"` tiene **PRIORIDAD #1 ABSOLUTA** sobre el método de deducción por número de teléfono o código postal.
    - **TICKET DE COMPRA (`n.jpg`, `_n`, `_nov`, `nova`, `invoice_XXXXX.jpg`)**: Fuente prioritaria para **`SALE DATE`**, **`Sales rep`**, **`Location - Store`** y **`Productos`**.
