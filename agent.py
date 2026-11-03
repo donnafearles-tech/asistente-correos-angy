@@ -1793,7 +1793,7 @@ def consultar_productos_pendientes(invoice: str, buscar_compensaciones_o_regalos
         "pregunta_obligatoria": "¿Deseas que haga una búsqueda de productos pedidos por algún agente por compensación o regalo?"
     }
 
-def procesar_caso_zendesk(invoice: str, nombre: str, email: str, telefono: str, tienda: str, region: str) -> dict:
+def procesar_caso_zendesk(invoice: str, nombre: str, email: str, telefono: str, tienda: str, region: str, productos: list[str] = None, comentario: str = "") -> dict:
     """
     Registra o actualiza un caso en Zendesk para el cliente con la información proporcionada.
     Valida y bloquea automáticamente teléfonos de empresa (8882494189) antes de enviarlo.
@@ -1810,17 +1810,139 @@ def procesar_caso_zendesk(invoice: str, nombre: str, email: str, telefono: str, 
         "name": nombre,
         "email": email,
         "phone": telefono,
-        "comment": "",
+        "comment": comentario or "",
         "store_location": tienda,
-        "region": region
+        "region": region,
+        "products": productos or []
     }
     try:
-        response = requests.post(url, json=payload, timeout=15)
+        response = requests.post(url, json=payload, timeout=25)
         if response.status_code == 200:
             return response.json()
         return {"error": f"Error al procesar en Zendesk. Código: {response.status_code}, Detalle: {response.text}"}
     except Exception as e:
         return {"error": f"Error de conexión al procesar Zendesk: {str(e)}"}
+
+
+def enviar_correo_instrucciones_cliente(
+    invoice: str,
+    email: str = None,
+    nombre: str = None,
+    telefono: str = None,
+    tienda: str = None,
+    region: str = None,
+    productos: list[str] = None,
+    comentario_personalizado: str = None
+) -> dict:
+    """
+    Envía las instrucciones oficiales de uso de productos (PRODUCT INSTRUCTIONS) por correo electrónico al cliente final (end user) vía Zendesk.
+    - Asunto automático oficial: 'PRODUCT INSTRUCTIONS - [TIENDA] - [CIUDAD] - [INVOICE]'
+    - Remitente oficial: 'customerservice@emacaribbean.com'
+    - Crea o actualiza el usuario en Zendesk (configurando su zona horaria calculada a partir del teléfono).
+    - Crea o actualiza el ticket como resuelto ('solved') con comentario público y tag ['Instructions'].
+    - Si no se proporcionan email, nombre, tienda o productos, Angy los resuelve automáticamente desde la sesión activa de pantalla o consultando Google Sheets.
+    """
+    clean_inv = str(invoice or "").strip()
+    if not clean_inv:
+        return {"error": "Se requiere el número de invoice para enviar las instrucciones al cliente."}
+
+    # 1. Resolver datos faltantes consultando contexto activo o Google Sheets
+    c_email = str(email or "").strip().lower() if email else ""
+    c_nombre = str(nombre or "").strip() if nombre else ""
+    c_telefono = str(telefono or "").strip() if telefono else ""
+    c_tienda = str(tienda or "").strip() if tienda else ""
+    c_region = str(region or "").strip() if region else ""
+    c_productos = list(productos) if (isinstance(productos, list) and productos) else []
+
+    # Consultar sesión activa de pantalla si falta información
+    try:
+        sesion = obtener_sesion_activa_frontend()
+        if sesion.get("estado") == "exito":
+            sp = sesion.get("sesion_pantalla", {})
+            if not c_email and sp.get("email"):
+                c_email = str(sp.get("email")).strip().lower()
+            if not c_nombre:
+                full_sp_name = f"{sp.get('name', '')} {sp.get('lastName', '')}".strip()
+                if full_sp_name:
+                    c_nombre = full_sp_name
+            if not c_telefono and sp.get("telephone"):
+                c_telefono = str(sp.get("telephone")).strip()
+            if not c_tienda and sp.get("storeName"):
+                c_tienda = str(sp.get("storeName")).strip()
+            if not c_region and sp.get("region"):
+                c_region = str(sp.get("region")).strip()
+            if not c_productos and sp.get("products"):
+                raw_prods = sp.get("products")
+                if isinstance(raw_prods, list):
+                    c_productos = [str(p).strip() for p in raw_prods if str(p).strip()]
+                elif isinstance(raw_prods, str):
+                    c_productos = [p.strip() for p in re.split(r"[\n|;,]+", raw_prods) if p.strip()]
+    except Exception:
+        pass
+
+    # Si aún falta email o nombre, consultar Sheets por invoice
+    if not (c_email and c_nombre and c_tienda):
+        try:
+            c_info = buscar_y_sanitizar_cliente(clean_inv)
+            if isinstance(c_info, dict) and "error" not in c_info:
+                if not c_email and c_info.get("email_sanitizado"):
+                    c_email = c_info.get("email_sanitizado")
+                if not c_nombre and c_info.get("nombre_completo"):
+                    c_nombre = c_info.get("nombre_completo")
+                if not c_telefono and c_info.get("telefono_sanitizado"):
+                    c_telefono = c_info.get("telefono_sanitizado")
+                if not c_tienda and c_info.get("tienda"):
+                    c_tienda = c_info.get("tienda")
+                if not c_region and c_info.get("region_state"):
+                    c_region = c_info.get("region_state")
+                if not c_productos and c_info.get("productos"):
+                    c_productos = [p.strip() for p in re.split(r"[\n|;,]+", str(c_info.get("productos"))) if p.strip()]
+        except Exception:
+            pass
+
+    if not c_email:
+        return {
+            "error": f"No se pudo determinar el correo electrónico del cliente para la factura {clean_inv}. Por favor proporciona el email del cliente."
+        }
+
+    # Bloqueo estricto de teléfono corporativo
+    clean_digits = "".join(filter(str.isdigit, c_telefono))
+    if len(clean_digits) > 10:
+        clean_digits = clean_digits[-10:]
+    if clean_digits in COMPANY_PHONES:
+        c_telefono = ""
+
+    url = f"{BACKEND_URL}/api/process-zendesk-case"
+    payload = {
+        "invoice": clean_inv,
+        "name": c_nombre or "Customer",
+        "email": c_email,
+        "phone": c_telefono,
+        "comment": comentario_personalizado or "",
+        "store_location": c_tienda or "No especificada",
+        "region": c_region or "No especificada",
+        "products": c_productos,
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        if response.status_code == 200:
+            res_data = response.json()
+            ticket_id = res_data.get("ticketId") or (res_data.get("zendesk_response", {}).get("ticket", {}) or {}).get("id")
+            return {
+                "success": True,
+                "mensaje": f"Correo de instrucciones enviado exitosamente al cliente {c_nombre} ({c_email}) mediante el Ticket #{ticket_id} en Zendesk.",
+                "invoice": clean_inv,
+                "ticket_id": ticket_id,
+                "destinatario": c_email,
+                "cliente": c_nombre,
+                "tienda": c_tienda,
+                "productos_incluidos": c_productos,
+                "respuesta_zendesk": res_data,
+            }
+        return {"error": f"Error del servidor Zendesk ({response.status_code}): {response.text}"}
+    except Exception as e:
+        return {"error": f"Error de conexión al enviar correo con Zendesk: {str(e)}"}
 
 def consultar_usuario_zendesk(email: str = None, telefono: str = None, nombre: str = None, invoice: str = None) -> dict:
     """
@@ -3054,7 +3176,20 @@ Incluye SOLO los campos que el usuario quiere modificar.
     - Asegúrate SIEMPRE de que el ID de la carpeta en la URL empiece con el prefijo 'fo':
       * Si el ID es `d0c2794c-8bb2-4a0b-99f5-46726f1c4e7f`, el enlace exacto es: `https://morenamiabeautygroup.sharefile.com/#/folders/fod0c2794c-8bb2-4a0b-99f5-46726f1c4e7f`
       * Si el ID ya trae 'fo' como `fo921e25-e4d9-4fef-ae48-2a66d71bac06`, el enlace exacto es: `https://morenamiabeautygroup.sharefile.com/#/folders/fo921e25-e4d9-4fef-ae48-2a66d71bac06`
-    - Utiliza siempre el campo `sharefile_folder_url` que te devuelven directamente tus herramientas (`obtener_textos_de_archivos`, `escanear_y_rellenar_master_shippings`, `analizar_multiples_invoices_devolucion`, `buscar_y_sanitizar_cliente`)."""),
+    - Utiliza siempre el campo `sharefile_folder_url` que te devuelven directamente tus herramientas (`obtener_textos_de_archivos`, `escanear_y_rellenar_master_shippings`, `analizar_multiples_invoices_devolucion`, `buscar_y_sanitizar_cliente`).
+
+17. ENVÍO DE CORREOS ELECTRÓNICOS E INSTRUCCIONES A CLIENTES FINALES (END USERS):
+    - Tienes la capacidad de enviar correos electrónicos oficiales con las instrucciones de uso de productos (PRODUCT INSTRUCTIONS) directamente al cliente final a través de Zendesk utilizando la herramienta `enviar_correo_instrucciones_cliente`.
+    - El correo se envía de forma oficial y elegante:
+      * Asunto oficial automático: `PRODUCT INSTRUCTIONS - [TIENDA] - [CIUDAD] - [INVOICE]`.
+      * Remitente oficial: `customerservice@emacaribbean.com`.
+      * Genera un ticket en Zendesk como resuelto (`status: "solved"`), con comentario público HTML y tag `["Instructions"]`.
+      * Configura la zona horaria del cliente en Zendesk en base a su teléfono de 10 dígitos.
+    - Cuándo usarlo:
+      * Cuando el usuario te pida: *"envía el correo al cliente"*, *"envíale las instrucciones al cliente de la factura X"*, *"mándale el instructivo por correo"*, etc.
+      * Si el usuario te especifica un número de invoice, `enviar_correo_instrucciones_cliente` obtiene automáticamente el nombre, email, teléfono, tienda y lista de productos desde la sesión activa de pantalla o desde Google Sheets sin que el usuario tenga que escribirlos de nuevo.
+      * Si el usuario redactó o te pidió redactar un mensaje específico, pásalo en `comentario_personalizado`. Si no se pasa, el sistema genera de forma automática la plantilla oficial de lujo con el instructivo de cada producto comprado.
+      * Informa siempre al usuario el número de Ticket de Zendesk generado, el correo destinatario y los productos incluidos en el correo."""),
     tools=[
         diagnosticar_y_obtener_contexto_completo,
         explorar_catalogo_hojas_drive,
@@ -3068,6 +3203,7 @@ Incluye SOLO los campos que el usuario quiere modificar.
         consultar_envios_y_motivos,
         consultar_productos_pendientes,
         analizar_multiples_invoices_devolucion,
+        enviar_correo_instrucciones_cliente,
         procesar_caso_zendesk,
         consultar_usuario_zendesk,
         actualizar_usuario_zendesk,
