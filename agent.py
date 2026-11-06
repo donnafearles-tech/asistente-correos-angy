@@ -970,6 +970,51 @@ def _direct_find_all_invoice_rows(
     return matches
 
 
+def _direct_find_all_phone_rows(
+    spreadsheet_id: str,
+    sheet_name: str,
+    phone_digits: str,
+    preferred_col_idx: int | None = None,
+) -> list[dict]:
+    """
+    Busca TODAS las filas en una pestaña donde coincida el número de teléfono (últimos 10 o 7 dígitos).
+    """
+    rows = _direct_get_sheet_values(spreadsheet_id, f"'{sheet_name}'!A:AZ")
+    if not rows:
+        return []
+    matches = []
+    raw_digits = re.sub(r"\D", "", str(phone_digits or ""))
+    target_clean = raw_digits[-10:] if len(raw_digits) >= 10 else raw_digits
+
+    if not target_clean or len(target_clean) < 7:
+        return []
+
+    for i, row in enumerate(rows):
+        matched = False
+        # 1. Probar en preferred_col_idx (ej: Col D=3 en Master Shippings, Col G=6 en Customer Info)
+        if preferred_col_idx is not None and preferred_col_idx < len(row):
+            raw_val = str(row[preferred_col_idx] or "").strip()
+            cell_digits = re.sub(r"\D", "", raw_val)
+            clean_cell = cell_digits[-10:] if len(cell_digits) >= 10 else cell_digits
+            if clean_cell and (clean_cell == target_clean or target_clean in cell_digits or cell_digits in target_clean):
+                matched = True
+
+        # 2. Si no hubo coincidencia en la columna preferida, escanear primeras 15 columnas
+        if not matched:
+            for c_idx in range(min(len(row), 15)):
+                raw_val = str(row[c_idx] or "").strip()
+                cell_digits = re.sub(r"\D", "", raw_val)
+                if len(cell_digits) >= 7:
+                    clean_cell = cell_digits[-10:] if len(cell_digits) >= 10 else cell_digits
+                    if clean_cell == target_clean or (len(target_clean) >= 10 and target_clean in cell_digits):
+                        matched = True
+                        break
+
+        if matched:
+            matches.append({"rowIndex": i + 1, "rowValues": row})
+    return matches
+
+
 def _direct_read_row_cells(
     invoice: str = "",
     fila: int = 0,
@@ -2373,14 +2418,108 @@ def actualizar_registro_sheets(
     except Exception as e:
         return {"error": f"Error de conexión al actualizar Sheets: {str(e)}"}
 
+
+def buscar_cliente_por_telefono(telefono: str) -> dict:
+    """
+    Busca un cliente por su número telefónico en los libros de Google Sheets:
+    - En MASTER SHIPPINGS busca específicamente en la Columna D (Phone #) en pestañas 2026, 2025, 2024, 2023.
+    - En Customer Information - Shippings busca específicamente en la Columna G (TELEPHONE) en pestañas 2026, 2025, 2024, 2023.
+    Normaliza el número a sus últimos 10 dígitos y bloquea números corporativos.
+    Retorna el cliente, facturas asociadas, pestañas y número de fila exacta donde se encuentra.
+    """
+    clean_digits = re.sub(r"\D", "", str(telefono or ""))
+    if not clean_digits or len(clean_digits) < 7:
+        return {
+            "success": False,
+            "error": f"El número telefónico proporcionado '{telefono}' no contiene suficientes dígitos válidos (mínimo 7 dígitos).",
+        }
+
+    norm_10 = clean_digits[-10:] if len(clean_digits) >= 10 else clean_digits
+    if norm_10 == "8882494189":
+        return {
+            "success": False,
+            "advertencia": "El número 888-249-4189 corresponde al conmutador corporativo de la empresa, no a un cliente final.",
+            "telefono": telefono,
+            "total_coincidencias": 0,
+            "resultados": [],
+        }
+
+    # 1. Intentar consultar endpoint del backend /api/sheets/by-phone
+    try:
+        url = f"{BACKEND_URL}/api/sheets/by-phone"
+        resp = requests.get(url, params={"phone": clean_digits}, timeout=25)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("success"):
+                return data
+    except Exception as e:
+        logging.warning(f"Error consultando /api/sheets/by-phone en backend: {e}")
+
+    # 2. Fallback con búsqueda directa en Google Sheets (Sheets API)
+    years = ["2026", "2025", "2024", "2023"]
+    matches = []
+    found_invoices = set()
+
+    # Buscar en Customer Information (Columna G = index 6)
+    for y in years:
+        found_rows = _direct_find_all_phone_rows(CUSTOMER_INFO_SPREADSHEET_ID, y, clean_digits, preferred_col_idx=6)
+        if found_rows:
+            headers = _direct_get_sheet_headers(CUSTOMER_INFO_SPREADSHEET_ID, y)
+            for fr in found_rows:
+                bd = _direct_build_row_cell_breakdown("customer_info", y, fr["rowIndex"], fr["rowValues"], headers)
+                inv = bd.get("datosPrincipales", {}).get("invoice")
+                if inv:
+                    found_invoices.add(inv)
+                matches.append(bd)
+
+    # Buscar en Master Shippings (Columna D = index 3)
+    for y in years:
+        found_rows = _direct_find_all_phone_rows(MASTER_SHIPPINGS_SPREADSHEET_ID, y, clean_digits, preferred_col_idx=3)
+        if found_rows:
+            headers = _direct_get_sheet_headers(MASTER_SHIPPINGS_SPREADSHEET_ID, y)
+            for fr in found_rows:
+                bd = _direct_build_row_cell_breakdown("master_shippings", y, fr["rowIndex"], fr["rowValues"], headers)
+                inv = bd.get("datosPrincipales", {}).get("invoice")
+                if inv:
+                    found_invoices.add(inv)
+                matches.append(bd)
+
+    return {
+        "success": True,
+        "telefonoBuscado": telefono,
+        "telefonoNormalizado": norm_10,
+        "total_coincidencias": len(matches),
+        "invoicesEncontrados": list(found_invoices),
+        "coincidencias": matches,
+    }
+
+
 def buscar_clientes(filtro: str = None, campo: str = None, valor: str = None) -> dict:
     """
     Busca y filtra clientes en Google Sheets (incluyendo MASTER SHIPPINGS y Customer Information en pestañas 2023-2026).
-    Soporta búsqueda directa por número de invoice o texto libre sin desbordar el límite de memoria de Cloud Run.
+    Soporta búsqueda directa por número de invoice, por teléfono o por texto libre sin desbordar el límite de memoria de Cloud Run.
     """
     search_campo = str(campo).strip().lower() if campo else None
     search_valor = str(valor).strip() if valor else None
     search_filtro = str(filtro).strip() if filtro else None
+
+    # Si busca por teléfono o el texto parece un número telefónico (al menos 7 dígitos y caracteres típicos de teléfono)
+    phone_candidate = None
+    if search_campo in ("telefono", "phone", "tel") and search_valor:
+        phone_candidate = search_valor
+    elif search_filtro and len(re.sub(r"\D", "", search_filtro)) >= 7 and not re.match(r"^(?:inv[o0]ice[\s_#-]*|mm[\s_-]*)?\d{3,8}$", search_filtro, re.IGNORECASE):
+        digits_only = re.sub(r"\D", "", search_filtro)
+        if len(digits_only) >= 10 or "-" in search_filtro or "(" in search_filtro:
+            phone_candidate = search_filtro
+    elif search_valor and len(re.sub(r"\D", "", search_valor)) >= 7 and not re.match(r"^(?:inv[o0]ice[\s_#-]*|mm[\s_-]*)?\d{3,8}$", search_valor, re.IGNORECASE):
+        digits_only = re.sub(r"\D", "", search_valor)
+        if len(digits_only) >= 10 or "-" in search_valor or "(" in search_valor:
+            phone_candidate = search_valor
+
+    if phone_candidate:
+        phone_res = buscar_cliente_por_telefono(phone_candidate)
+        if phone_res.get("success") and phone_res.get("total_coincidencias", 0) > 0:
+            return phone_res
 
     # Si busca por invoice específico o un número de factura, consultar también record-by-invoice directamente
     candidate_invoice = None
@@ -3189,7 +3328,18 @@ Incluye SOLO los campos que el usuario quiere modificar.
       * Cuando el usuario te pida: *"envía el correo al cliente"*, *"envíale las instrucciones al cliente de la factura X"*, *"mándale el instructivo por correo"*, etc.
       * Si el usuario te especifica un número de invoice, `enviar_correo_instrucciones_cliente` obtiene automáticamente el nombre, email, teléfono, tienda y lista de productos desde la sesión activa de pantalla o desde Google Sheets sin que el usuario tenga que escribirlos de nuevo.
       * Si el usuario redactó o te pidió redactar un mensaje específico, pásalo en `comentario_personalizado`. Si no se pasa, el sistema genera de forma automática la plantilla oficial de lujo con el instructivo de cada producto comprado.
-      * Informa siempre al usuario el número de Ticket de Zendesk generado, el correo destinatario y los productos incluidos en el correo."""),
+      * Informa siempre al usuario el número de Ticket de Zendesk generado, el correo destinatario y los productos incluidos en el correo.
+
+18. BÚSQUEDA DE CLIENTES POR NÚMERO TELEFÓNICO:
+    - Tienes la capacidad de localizar clientes y sus facturas buscando por número telefónico con la herramienta `buscar_cliente_por_telefono`.
+    - Lugares de búsqueda oficial:
+      * En **MASTER SHIPPINGS** busca específicamente en la **Columna D** (`Phone #`).
+      * En **Customer Information - Shippings** busca específicamente en la **Columna G** (`TELEPHONE`).
+      * Escanea todas las pestañas de años (`2026`, `2025`, `2024`, `2023`).
+    - Normalización: Limpia prefijos (`+1`), espacios, paréntesis o guiones y compara con los últimos 10 dígitos.
+    - Bloqueo de seguridad: Si el número es `8882494189`, se advierte que es el conmutador de la empresa.
+    - Si el usuario te proporciona un teléfono como *"busca el cliente del teléfono 732-674-1040"* o *"a quién pertenece este teléfono..."*, ejecuta inmediatamente `buscar_cliente_por_telefono(telefono)`.
+    - Reporta el nombre del cliente, las facturas encontradas, los libros/pestañas donde aparece, la fila exacta y los datos de envío/productos asociados."""),
     tools=[
         diagnosticar_y_obtener_contexto_completo,
         explorar_catalogo_hojas_drive,
@@ -3212,6 +3362,7 @@ Incluye SOLO los campos que el usuario quiere modificar.
         escanear_y_rellenar_master_shippings,
         enviar_payload_master_shippings,
         actualizar_registro_sheets,
+        buscar_cliente_por_telefono,
         buscar_clientes,
         validar_correo,
     ],
