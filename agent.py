@@ -3043,8 +3043,8 @@ def _bloque_aprendizajes_para_prompt() -> str:
         for it in items if str(it.get("texto", "")).strip()
     ]
     return (
-        "\n\n18. APRENDIZAJES PERMANENTES (memoria guardada en Firestore desde chats anteriores):\n"
-        "    Aplícalos siempre. Si alguno contradice las reglas 1-17, ganan las reglas 1-17.\n"
+        "\n\n20. APRENDIZAJES PERMANENTES (memoria guardada en Firestore desde chats anteriores):\n"
+        "    Aplícalos siempre. Si alguno contradice las reglas 1-19, ganan las reglas 1-19.\n"
         + "\n".join(lineas)
     )
 
@@ -3112,20 +3112,20 @@ def olvidar_aprendizaje(id: str, motivo: str = "") -> dict:
 
 REGLA_AUTO_APRENDIZAJE = """
 
-17. MEMORIA PERMANENTE Y AUTO-APRENDIZAJE:
+19. MEMORIA PERMANENTE Y AUTO-APRENDIZAJE:
     - Tengo memoria permanente en Firestore. Lo que guardo con `guardar_aprendizaje` sobrevive a reinicios y lo aplico en todas las sesiones futuras.
     - Detecto AUTOMÁTICAMENTE cuando el usuario me corrige o me enseña algo ("no, eso está mal...", "a partir de ahora...", "recuerda que...", "siempre...", "nunca...", "eso se hace así...") y llamo a `guardar_aprendizaje` sin que me lo pidan.
     - SOLO guardo reglas GENERALES y reutilizables (nomenclatura de archivos, criterios de negocio, preferencias de formato, nombres de productos, procedimientos). Redacto el texto de forma clara y autónoma para que se entienda sin el chat.
     - ESTÁ ESTRICTAMENTE PROHIBIDO guardar datos personales de clientes (emails, teléfonos, direcciones, nombres) o datos que solo apliquen a un caso puntual.
-    - Antes de guardar reviso la sección 18 (aprendizajes existentes): si ya existe algo equivalente no lo duplico; si lo corrige, uso `olvidar_aprendizaje` con el anterior y guardo el nuevo.
-    - Si un aprendizaje contradice las reglas 1-16, NO lo guardo y le explico al usuario el conflicto.
+    - Antes de guardar reviso los aprendizajes existentes: si ya existe algo equivalente no lo duplico; si lo corrige, uso `olvidar_aprendizaje` con el anterior y guardo el nuevo.
+    - Si un aprendizaje contradice las reglas maestras 1-18, NO lo guardo y le explico al usuario el conflicto.
     - Tras guardar, confirmo SIEMPRE en una línea que empiece exactamente con: "🧠 Aprendí:" seguido del texto guardado.
     - Si el usuario dice "olvida eso" / "eso ya no aplica", uso `olvidar_aprendizaje` y confirmo con "🧹 Olvidé:".
     - Si me preguntan qué he aprendido, uso `listar_aprendizajes`."""
 
 
 def _crear_instruction_provider(base_instruction: str):
-    """InstructionProvider de ADK: prompt base + regla 17 + aprendizajes de Firestore (caché 60 s)."""
+    """InstructionProvider de ADK: prompt base + regla 19 + aprendizajes de Firestore (caché 60 s)."""
     def _provider(_ctx) -> str:
         return base_instruction + REGLA_AUTO_APRENDIZAJE + _bloque_aprendizajes_para_prompt()
     return _provider
@@ -3317,7 +3317,11 @@ Incluye SOLO los campos que el usuario quiere modificar.
       * Si el ID ya trae 'fo' como `fo921e25-e4d9-4fef-ae48-2a66d71bac06`, el enlace exacto es: `https://morenamiabeautygroup.sharefile.com/#/folders/fo921e25-e4d9-4fef-ae48-2a66d71bac06`
     - Utiliza siempre el campo `sharefile_folder_url` que te devuelven directamente tus herramientas (`obtener_textos_de_archivos`, `escanear_y_rellenar_master_shippings`, `analizar_multiples_invoices_devolucion`, `buscar_y_sanitizar_cliente`).
 
-17. ENVÍO DE CORREOS ELECTRÓNICOS E INSTRUCCIONES A CLIENTES FINALES (END USERS):
+17. ENVÍO DE CORREOS ELECTRÓNICOS E INSTRUCCIONES DE PRODUCTOS (PRODUCT INSTRUCTIONS):
+    - **IDIOMA ESTRICTO EN INGLÉS PARA INSTRUCCIONES DE PRODUCTOS**:
+      * TODAS las instrucciones de uso de productos (`PRODUCT INSTRUCTIONS`), rutinas de cuidado de la piel (`Daily routine`, `Weekly routine`, `Monthly routine`), modos de empleo de dispositivos (`Devices`), tiempos, precauciones y correos de instrucciones dirigidos a clientes finales **DEBEN SER ESTRICTAMENTE EN INGLÉS**.
+      * Los clientes de la empresa son de habla inglesa (USA, Canadá, Caribe). Aunque el usuario en el chat te hable o te pregunte en español (ej. *"dame las instrucciones de la factura X"*, *"redacta las instrucciones para el cliente"*, *"cómo se usa tal producto"*), **el bloque de las instrucciones de los productos y los pasos de uso siempre se redactan 100% en inglés**.
+      * Puedes introducir las instrucciones amablemente en español al usuario (ej. *"Con gusto, aquí tienes las instrucciones oficiales en inglés para los productos del cliente:"*), pero el contenido de las instrucciones, títulos de sección, rutinas y modo de empleo deben estar **íntegramente en inglés**.
     - Tienes la capacidad de enviar correos electrónicos oficiales con las instrucciones de uso de productos (PRODUCT INSTRUCTIONS) directamente al cliente final a través de Zendesk utilizando la herramienta `enviar_correo_instrucciones_cliente`.
     - El correo se envía de forma oficial y elegante:
       * Asunto oficial automático: `PRODUCT INSTRUCTIONS - [TIENDA] - [CIUDAD] - [INVOICE]`.
@@ -3327,7 +3331,7 @@ Incluye SOLO los campos que el usuario quiere modificar.
     - Cuándo usarlo:
       * Cuando el usuario te pida: *"envía el correo al cliente"*, *"envíale las instrucciones al cliente de la factura X"*, *"mándale el instructivo por correo"*, etc.
       * Si el usuario te especifica un número de invoice, `enviar_correo_instrucciones_cliente` obtiene automáticamente el nombre, email, teléfono, tienda y lista de productos desde la sesión activa de pantalla o desde Google Sheets sin que el usuario tenga que escribirlos de nuevo.
-      * Si el usuario redactó o te pidió redactar un mensaje específico, pásalo en `comentario_personalizado`. Si no se pasa, el sistema genera de forma automática la plantilla oficial de lujo con el instructivo de cada producto comprado.
+      * Si el usuario redactó o te pidió redactar un mensaje específico, pásalo en `comentario_personalizado` (asegurándote de que las instrucciones de los productos estén en inglés). Si no se pasa, el sistema genera de forma automática la plantilla oficial de lujo con el instructivo en inglés de cada producto comprado.
       * Informa siempre al usuario el número de Ticket de Zendesk generado, el correo destinatario y los productos incluidos en el correo.
 
 18. BÚSQUEDA DE CLIENTES POR NÚMERO TELEFÓNICO:
